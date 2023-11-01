@@ -1,93 +1,291 @@
-use pallas::ledger::traverse::MultiEraBlock;
+use std::sync::Arc;
 
-use crate::{crosscut, model, prelude::*};
+use async_trait;
+use pallas::crypto::hash::Hash;
+use pallas::ledger::configs::byron::GenesisUtxo;
+use pallas::{ledger::traverse::MultiEraBlock, network::miniprotocols::Point};
+use tokio::sync::Mutex;
+
+use crate::model::{CRDTCommand, EnrichedBlockPayload};
+use crate::pipeline::Context;
+
+use crate::{model, reducers};
 
 use super::Reducer;
 
-type InputPort = gasket::messaging::TwoPhaseInputPort<model::EnrichedBlockPayload>;
-type OutputPort = gasket::messaging::OutputPort<model::CRDTCommand>;
+use gasket::framework::*;
+use gasket::messaging::tokio::{connect_ports, InputPort, OutputPort};
 
-pub struct Worker {
-    input: InputPort,
-    output: OutputPort,
-    reducers: Vec<Reducer>,
-    policy: crosscut::policies::RuntimePolicy,
-    ops_count: gasket::metrics::Counter,
-    last_block: gasket::metrics::Gauge,
-}
+pub struct _Config {
+    _reducers: Vec<Reducer>,
+} // todo use this like all the other gasket items
+
+pub struct Worker {}
 
 impl Worker {
-    pub fn new(
-        reducers: Vec<Reducer>,
-        input: InputPort,
-        output: OutputPort,
-        policy: crosscut::policies::RuntimePolicy,
-    ) -> Self {
-        Worker {
-            reducers,
-            input,
-            output,
-            policy,
-            ops_count: Default::default(),
-            last_block: Default::default(),
-        }
-    }
-
-    fn reduce_block<'b>(
+    // todo cut down on clones here
+    async fn reduce_block(
         &mut self,
-        block: &'b [u8],
-        ctx: &model::BlockContext,
-    ) -> Result<(), gasket::error::Error> {
-        let block = MultiEraBlock::decode(block)
-            .map_err(crate::Error::cbor)
-            .apply_policy(&self.policy)
-            .or_panic()?;
+        block_raw: Vec<u8>,
+        genesis_utxos: Option<Vec<GenesisUtxo>>,
+        byron_genesis_hash: Option<Hash<32>>,
+        rollback: bool,
+        block_ctx: Option<model::BlockContext>,
+        last_good_block_rollback_info: Option<(Point, u64)>,
+        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
+        reducers: &mut Vec<Reducer>,
+        ops_count: &gasket::metrics::Counter,
+        reducer_errors: &gasket::metrics::Counter,
+    ) -> Result<(), WorkerError> {
+        let mut point: Point = Point::Origin;
 
-        let block = match block {
-            Some(x) => x,
-            None => return Ok(()),
-        };
+        let mut handles = Vec::new();
 
-        self.last_block.set(block.number() as i64);
+        match (
+            !block_raw.is_empty(),
+            byron_genesis_hash,
+            genesis_utxos.to_owned(),
+        ) {
+            (true, None, None) => {
+                match MultiEraBlock::decode(&block_raw) {
+                    Ok(block_parsed) => {
+                        point = match rollback {
+                            true => {
+                                let (last_point, _) =
+                                    last_good_block_rollback_info.clone().unwrap();
+                                last_point
+                            }
+                            false => {
+                                Point::Specific(block_parsed.slot(), block_parsed.hash().to_vec())
+                            }
+                        };
 
-        self.output.send(gasket::messaging::Message::from(
-            model::CRDTCommand::block_starting(&block),
-        ))?;
+                        output
+                            .lock()
+                            .await
+                            .send(
+                                model::CRDTCommand::block_starting(
+                                    Some(block_parsed.clone()),
+                                    None,
+                                )
+                                .into(),
+                            )
+                            .await
+                            .map_err(|_| WorkerError::Send)?;
 
-        for reducer in self.reducers.iter_mut() {
-            reducer.reduce_block(&block, ctx, &mut self.output)?;
-            self.ops_count.inc(1);
-        }
+                        for reducer in reducers {
+                            handles.push(reducer.reduce_block(
+                                Some(block_parsed.clone()),
+                                block_ctx.clone(),
+                                genesis_utxos.clone(),
+                                byron_genesis_hash.clone(),
+                                rollback.clone(),
+                                output.clone(),
+                            ));
+                        }
 
-        self.output.send(gasket::messaging::Message::from(
-            model::CRDTCommand::block_finished(&block),
-        ))?;
+                        let results = futures::future::join_all(handles).await;
 
-        Ok(())
+                        let mut n = 0;
+
+                        for res in results {
+                            match res {
+                                Ok(_) => {
+                                    n += 1;
+                                    ops_count.inc(1);
+                                }
+                                Err(e) => {
+                                    log::warn!("reducer error! {:?} {}", e, n); // todo panic here and interrupt
+                                    reducer_errors.inc(1);
+                                    n += 1;
+                                }
+                            };
+                        }
+
+                        Ok(())
+                    }
+
+                    Err(_) => Err(gasket::framework::WorkerError::Panic),
+                }
+            }
+
+            (false, Some(byron_genesis_hash), Some(_)) => {
+                point = Point::Specific(0, byron_genesis_hash.to_vec());
+
+                output
+                    .lock()
+                    .await
+                    .send(
+                        model::CRDTCommand::block_starting(None, Some(byron_genesis_hash.clone()))
+                            .into(),
+                    )
+                    .await
+                    .map_err(|_| WorkerError::Send)?;
+
+                for reducer in reducers {
+                    handles.push(reducer.reduce_block(
+                        None,
+                        None,
+                        genesis_utxos.clone(),
+                        Some(byron_genesis_hash.clone()),
+                        rollback.clone(),
+                        output.clone(),
+                    ));
+                }
+
+                let results = futures::future::join_all(handles).await;
+
+                let mut n = 0;
+
+                for res in results {
+                    match res {
+                        Ok(_) => {
+                            n += 1;
+                            ops_count.inc(1);
+                        }
+                        Err(e) => {
+                            log::warn!("reducer error! {:?} {}", e, n); // todo panic here and interrupt
+                            reducer_errors.inc(1);
+                            n += 1;
+                        }
+                    };
+                }
+
+                Ok(())
+            }
+
+            _ => Err(gasket::framework::WorkerError::Panic),
+        }?;
+
+        output
+            .lock()
+            .await
+            .send(
+                model::CRDTCommand::block_finished(
+                    point.clone(),
+                    match block_raw.is_empty() {
+                        true => None,
+                        false => Some(block_raw.clone()),
+                    },
+                    rollback,
+                )
+                .into(),
+            )
+            .await
+            .map_err(|_| WorkerError::Send)
     }
 }
 
-impl gasket::runtime::Worker for Worker {
-    fn metrics(&self) -> gasket::metrics::Registry {
-        gasket::metrics::Builder::new()
-            .with_counter("ops_count", &self.ops_count)
-            .with_gauge("last_block", &self.last_block)
-            .build()
+pub fn bootstrap(
+    ctx: Arc<Mutex<Context>>,
+    reducers: Vec<reducers::Config>,
+    storage_input: &mut InputPort<CRDTCommand>,
+) -> Stage {
+    let mut output: OutputPort<CRDTCommand> = Default::default();
+    connect_ports(&mut output, storage_input, 100);
+
+    let stage = Stage {
+        ctx: ctx.clone(),
+        reducers: reducers
+            .into_iter()
+            .map(|x| x.bootstrapper(ctx.clone()))
+            .collect(),
+        input: Default::default(),
+        output: Arc::new(Mutex::new(output)),
+        ops_count: Default::default(),
+        reducer_errors: Default::default(),
+    };
+
+    stage
+}
+
+#[derive(Stage)]
+#[stage(
+    name = "n2n-reducers",
+    unit = "EnrichedBlockPayload",
+    worker = "Worker"
+)]
+pub struct Stage {
+    reducers: Vec<Reducer>,
+    ctx: Arc<Mutex<Context>>,
+
+    pub input: InputPort<EnrichedBlockPayload>,
+    pub output: Arc<Mutex<OutputPort<CRDTCommand>>>,
+
+    #[metric]
+    ops_count: gasket::metrics::Counter,
+
+    #[metric]
+    reducer_errors: gasket::metrics::Counter,
+}
+
+#[async_trait::async_trait(?Send)]
+impl gasket::framework::Worker<Stage> for Worker {
+    async fn bootstrap(_: &Stage) -> Result<Self, WorkerError> {
+        Ok(Self {})
     }
 
-    fn work(&mut self) -> gasket::runtime::WorkResult {
-        let msg = self.input.recv_or_idle()?;
-
-        match msg.payload {
-            model::EnrichedBlockPayload::RollForward(block, ctx) => {
-                self.reduce_block(&block, &ctx)?
-            }
-            model::EnrichedBlockPayload::RollBack(point) => {
-                log::warn!("rollback requested for {:?}", point);
-            }
+    async fn schedule(
+        &mut self,
+        stage: &mut Stage,
+    ) -> Result<WorkSchedule<EnrichedBlockPayload>, WorkerError> {
+        match stage.input.recv().await {
+            Ok(c) => Ok(WorkSchedule::Unit(c.payload)),
+            Err(_) => Err(WorkerError::Retry),
         }
+    }
 
-        self.input.commit();
-        Ok(gasket::runtime::WorkOutcome::Partial)
+    async fn execute(
+        &mut self,
+        unit: &EnrichedBlockPayload,
+        stage: &mut Stage,
+    ) -> Result<(), WorkerError> {
+        match unit {
+            model::EnrichedBlockPayload::RollForward(block, ctx) => self.reduce_block(
+                block.clone(),
+                None,
+                None,
+                false,
+                Some(ctx.clone()),
+                None,
+                stage.output.clone(),
+                &mut stage.reducers,
+                &stage.ops_count,
+                &stage.reducer_errors,
+            ),
+
+            model::EnrichedBlockPayload::RollBack(block, ctx, last_block_rollback_info) => self
+                .reduce_block(
+                    block.clone(),
+                    None,
+                    None,
+                    false,
+                    Some(ctx.clone()),
+                    Some(last_block_rollback_info.clone()),
+                    stage.output.clone(),
+                    &mut stage.reducers,
+                    &stage.ops_count,
+                    &stage.reducer_errors,
+                ),
+
+            model::EnrichedBlockPayload::RollForwardGenesis(utxos) => self.reduce_block(
+                vec![],
+                Some(utxos.clone()),
+                Some(Hash::<32>::new(
+                    hex::decode(stage.ctx.lock().await.chain.byron_known_hash.clone())
+                        .unwrap()
+                        .try_into()
+                        .expect("invalid byron block hash"),
+                )),
+                false,
+                None,
+                None,
+                stage.output.clone(),
+                &mut stage.reducers,
+                &stage.ops_count,
+                &stage.reducer_errors,
+            ),
+        }
+        .await
     }
 }

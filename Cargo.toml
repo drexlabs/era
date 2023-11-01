@@ -1,23 +1,45 @@
 [package]
-name = "scrolls"
-description = "Cardano Scrolls"
-version = "0.5.0"
+name = "era"
+description = "Hydrate a high-level, real-time, read-optimized cache of Cardano on-chain state with Era"
+version = "0.2.0"
 edition = "2021"
-repository = "https://github.com/txpipe/scrolls"
-homepage = "https://github.com/txpipe/scrolls"
-documentation = "https://docs.rs/scrolls"
+repository = "https://github.com/mkeen/era"
+homepage = "https://github.com/mkeen/era"
+documentation = "https://docs.rs/era"
 license = "Apache-2.0"
 readme = "README.md"
-authors = ["Santiago Carmuega <santiago@carmuega.me>"]
+authors = ["Santiago Carmuega <santiago@carmuega.me>", "Mike Keen <mwk@mikekeen.com>"]
 
+[package.metadata.deb]
+maintainer = "Mike Keen <mwk@mikekeen.com>"
+copyright = "2023 Drex Labs <https://drexlabs.ai>"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+A high-level, real-time blockchain indexer for Cardano and Redis"""
+depends = ""
+section = "Developer Tools"
+priority = "optional"
+assets = [
+    ["target/release/era", "usr/bin/", "755"],
+    ["scripts/systemd.service", "etc/systemd/system/era.service", "644"],
+    ["config.toml", "etc/era/config.toml", "644"],
+    ["assets/mainnet-byron-genesis.json", "etc/era/mainnet-byron-genesis.json", "644"]
+]
+
+[dev-dependencies]
+cargo-deb = "1.44.1"
 
 [dependencies]
-pallas = "0.17.0"
-# pallas = { path = "../pallas/pallas" }
-# pallas = { git = "https://github.com/txpipe/pallas.git" }
+pallas = { git = "https://github.com/txpipe/pallas.git"}
+pallas-addresses = { git = "https://github.com/txpipe/pallas.git", package = "pallas-addresses" }
+pallas-primitives = { git = "https://github.com/txpipe/pallas.git", package = "pallas-primitives" } 
+
+chrono = "0.4.31"
 hex = "0.4.3"
 net2 = "0.2.37"
+blake2 = "0.10.6"
 bech32 = "0.8.1"
+async-trait = "0.1.73"
 clap = { version = "3.2.6", features = ["derive"] }
 log = "0.4.14"
 env_logger = "0.9.0"
@@ -28,19 +50,23 @@ config = { version = "0.13.0", default-features = false, features = [
 ] }
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
+serde_cbor = "0.10" 
 minicbor = "0.14.1"
 prometheus_exporter = { version = "0.8.4", default-features = false }
-# gasket = { path = "../../construkts/gasket-rs" }
-gasket = { git = "https://github.com/construkts/gasket-rs.git" }
+gasket = { version = "^0.5", features = ["derive"] }
 thiserror = "1.0.30"
 redis = "0.21.5"
 sled = "0.34.7"
 lazy_static = "1.4.0"
 rayon = "1.5.3"
+crossbeam = "0.8.2"
+tonic = { version = "0.9.2", features = ["tls", "tls-roots"], optional = false }
+utxorpc = { version = "1.0.0-alpha.1" }
 
 # async feature
-futures = { version = "0.3.24", optional = true }
-tokio = { version = "1.21.1", features = ["rt-multi-thread"], optional = true }
+futures = { version = "0.3.28", optional = true }
+tokio = { version = "1.21.1", features = ["full"], optional = true }
+tokio-util = "0.7.8"
 
 # elastic feature
 elasticsearch = { version = "8.5.0-alpha.1", optional = true }
@@ -50,10 +76,12 @@ indicatif = { version = "0.17.0-rc.11", optional = true }
 
 # required for CI to complete successfully
 openssl = { version = "0.10", optional = true, features = ["vendored"] }
+ratatui = "0.24.0"
+crossterm = "0.27.0"
 
 [features]
 async = ["futures", "tokio"]
 elastic = ["elasticsearch", "async", "openssl"]
 unstable = ["elastic"]
 tui = ["indicatif"]
-default = ["tui"]
+default = ["tui", "async", "unstable"]

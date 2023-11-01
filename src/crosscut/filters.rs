@@ -93,7 +93,6 @@ pub struct TransactionPattern {
     pub is_valid: Option<bool>,
 }
 
-
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum Predicate {
@@ -224,7 +223,7 @@ fn eval_block(block: &MultiEraBlock, pattern: &BlockPattern) -> Result<bool, cra
 
 fn eval_transaction(tx: &MultiEraTx, pattern: &TransactionPattern) -> Result<bool, crate::Error> {
     if let Some(b) = pattern.is_valid {
-        return Ok(tx.is_valid() == b)
+        return Ok(tx.is_valid() == b);
     }
 
     Ok(false)
@@ -289,22 +288,16 @@ pub fn eval_predicate(
 mod tests {
     use pallas::ledger::traverse::MultiEraBlock;
 
-    use crate::{
-        crosscut::policies::{ErrorAction, RuntimePolicy},
-        model::BlockContext,
-    };
+    use crate::{crosscut, model::BlockContext};
 
     use super::{eval_predicate, AddressPattern, Predicate};
 
     fn test_predicate_in_block(predicate: &Predicate, expected_txs: &[usize]) {
-        let cbor = include_str!("../../assets/test.block");
+        let cbor = include_str!("../../assets/blocks/scrolls");
         let bytes = hex::decode(cbor).unwrap();
         let block = MultiEraBlock::decode(&bytes).unwrap();
         let ctx = BlockContext::default();
-        let policy = RuntimePolicy {
-            missing_data: Some(ErrorAction::Skip),
-            ..Default::default()
-        };
+        let policy: crosscut::policies::RuntimePolicy = Default::default();
 
         let idxs: Vec<_> = block
             .txs()
