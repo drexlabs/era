@@ -419,12 +419,7 @@ impl TuiConsole {
 
         let d = SystemTime::UNIX_EPOCH + Duration::from_secs(block_time);
         let datetime = DateTime::<Utc>::from(d);
-        let date_string = datetime
-            .format(
-                "%Y-%m-%d
-    %H:%M:%S",
-            )
-            .to_string();
+        let date_string = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
 
         self.terminal.draw(|frame| {
             let layout = Layout::default()
@@ -434,7 +429,7 @@ impl TuiConsole {
                     Constraint::Min(1),
                     Constraint::Length(1),
                     Constraint::Length(1),
-                    Constraint::Min(5),
+                    Constraint::Length(5),
                     Constraint::Length(1),
                     Constraint::Length(1),
                     Constraint::Length(2),
@@ -513,7 +508,7 @@ impl TuiConsole {
                             .padding(Padding::new(
                                 3, // left
                                 1, // right
-                                2, // top
+                                1, // top
                                 1, // bottom
                             ))
                             .fg(Color::Blue),
@@ -538,7 +533,7 @@ impl TuiConsole {
                 .direction(Direction::Horizontal)
                 .constraints(vec![
                     Constraint::Length(progress_layout[0].width - 1),
-                    Constraint::Max(10),
+                    Constraint::Max(20),
                     Constraint::Min(10),
                     Constraint::Length(14),
                 ])
