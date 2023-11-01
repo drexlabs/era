@@ -1,0 +1,37 @@
+===========================================================
+                        ERA NOTICE
+===========================================================
+
+This project, Era, is a fork of Scrolls as of 9/6/2023.
+
+--------------------
+Copyright Information
+--------------------
+
+Unless otherwise specified, all files in this project are:
+Copyright (c) 2023 Drex Labs, DAO LLC.
+
+Portions of this project are derived from Scrolls:
+Copyright (c) txpipe
+
+All rights reserved.
+
+Era is licensed under the Apache License, Version 2.0 (the "License"). You may not use these files except in compliance with the License. A copy of the License is provided in the LICENSE file in this repository. You can also obtain a copy of the License at:
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+
+--------------------
+Acknowledgments
+--------------------
+
+We want to acknowledge the developers and contributors of Scrolls for their work -- particularly Santiago Carmuega of TxPipe. Era builds upon the foundation provided by Santiago and the Scrolls development community. For a comprehensive list of contributors to the original project, refer to https://github.com/txpipe/scrolls.
+
+--------------------
+Contact Information
+--------------------
+
+For questions or concerns related to Era, please contact:
+- Mike Keen - mike@drexlabs.ai
+
+===========================================================

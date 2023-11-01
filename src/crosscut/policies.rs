@@ -21,6 +21,7 @@ pub struct RuntimePolicy {
     pub cbor_errors: Option<ErrorAction>,
     pub ledger_errors: Option<ErrorAction>,
     pub any_error: Option<ErrorAction>,
+    pub gasket_errors: Option<ErrorAction>,
 }
 
 #[inline]
@@ -58,6 +59,7 @@ impl<T> AppliesPolicy for Result<T, crate::Error> {
                     crate::Error::MissingUtxo(_) => handle_error(err, &policy.missing_data),
                     crate::Error::CborError(_) => handle_error(err, &policy.cbor_errors),
                     crate::Error::LedgerError(_) => handle_error(err, &policy.ledger_errors),
+                    crate::Error::GasketError(_) => handle_error(err, &policy.gasket_errors),
                     _ => Err(err),
                 }
             }

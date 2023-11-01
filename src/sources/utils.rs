@@ -2,18 +2,16 @@ use std::convert::TryInto;
 
 use pallas::{
     codec::Fragment,
-    network::{
-        miniprotocols::{chainsync, Point},
-        multiplexer::StdChannel,
-    },
+    network::miniprotocols::{chainsync, Point},
 };
 
 use crate::{crosscut, storage};
 
-pub fn define_chainsync_start<C: Fragment>(
+#[inline]
+pub async fn define_chainsync_start<C: Fragment>(
     intersect: &crosscut::IntersectConfig,
     cursor: &mut storage::Cursor,
-    client: &mut chainsync::Client<StdChannel, C>,
+    client: &mut chainsync::Client<C>,
 ) -> Result<Option<Point>, crate::Error> {
     match cursor.last_point()? {
         Some(x) => {
@@ -21,6 +19,7 @@ pub fn define_chainsync_start<C: Fragment>(
             let point = x.try_into()?;
             let (point, _) = client
                 .find_intersect(vec![point])
+                .await
                 .map_err(crate::Error::ouroboros)?;
             return Ok(point);
         }
@@ -29,17 +28,24 @@ pub fn define_chainsync_start<C: Fragment>(
 
     match &intersect {
         crosscut::IntersectConfig::Origin => {
-            let point = client.intersect_origin().map_err(crate::Error::ouroboros)?;
+            let point = client
+                .intersect_origin()
+                .await
+                .map_err(crate::Error::ouroboros)?;
             Ok(Some(point))
         }
         crosscut::IntersectConfig::Tip => {
-            let point = client.intersect_tip().map_err(crate::Error::ouroboros)?;
+            let point = client
+                .intersect_tip()
+                .await
+                .map_err(crate::Error::ouroboros)?;
             Ok(Some(point))
         }
         crosscut::IntersectConfig::Point(_, _) => {
             let point = intersect.get_point().expect("point value");
             let (point, _) = client
                 .find_intersect(vec![point])
+                .await
                 .map_err(crate::Error::ouroboros)?;
             Ok(point)
         }
@@ -47,6 +53,7 @@ pub fn define_chainsync_start<C: Fragment>(
             let points = intersect.get_fallbacks().expect("fallback values");
             let (point, _) = client
                 .find_intersect(points)
+                .await
                 .map_err(crate::Error::ouroboros)?;
             Ok(point)
         }
