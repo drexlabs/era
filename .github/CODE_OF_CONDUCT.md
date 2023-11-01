@@ -1,128 +1,59 @@
-# Contributor Covenant Code of Conduct
+# Drex Labs -- Open-Source Code of Conduct 
 
-## Our Pledge
+## **1. Introduction**
 
-We as members, contributors, and leaders pledge to make participation in our
-community a harassment-free experience for everyone, regardless of age, body
-size, visible or invisible disability, ethnicity, sex characteristics, gender
-identity and expression, level of experience, education, socio-economic status,
-nationality, personal appearance, race, religion, or sexual identity
-and orientation.
+Welcome to Era by Drex Labs! We are eager for innovators and
+disruptors, and maniacs of all kinds to collab with us.
 
-We pledge to act and interact in ways that contribute to an open, welcoming,
-diverse, inclusive, and healthy community.
+This Code of Conduct outlines the rules of engagement and our
+expectations for contributors.
 
-## Our Standards
+## **2. Drex Labs' Commitment to You**
 
-Examples of behavior that contributes to a positive environment for our
-community include:
+Drex Labs commitment to you is to make the Era project a unique,
+vibrant, and unorthodox hub for creativity in coding. We believe every
+voice matters and all contributions - no matter how unconventional -
+have worth. Be prepared to see the usual rules completely disregarded here.
 
-* Demonstrating empathy and kindness toward other people
-* Being respectful of differing opinions, viewpoints, and experiences
-* Giving and gracefully accepting constructive feedback
-* Accepting responsibility and apologizing to those affected by our mistakes,
-  and learning from the experience
-* Focusing on what is best not just for us as individuals, but for the
-  overall community
+## **3. Let The Sparks Fly**
 
-Examples of unacceptable behavior include:
+We believe that passion can often be mistaken for abrasiveness. Here,
+we encourage you to express your ideas vehemently, debate fiercely,
+and even let the sparks fly when necessary. Passionate arguments are
+often a sign that you care and are invested in the project, which we
+highly value.
 
-* The use of sexualized language or imagery, and sexual attention or
-  advances of any kind
-* Trolling, insulting or derogatory comments, and personal or political attacks
-* Public or private harassment
-* Publishing others' private information, such as a physical or email
-  address, without their explicit permission
-* Other conduct which could reasonably be considered inappropriate in a
-  professional setting
+However, remember that even the fieriest discussions should have their
+boundaries: attack ideas, not individuals.
 
-## Enforcement Responsibilities
+## **4. Brace for Impact**
 
-Community leaders are responsible for clarifying and enforcing our standards of
-acceptable behavior and will take appropriate and fair corrective action in
-response to any behavior that they deem inappropriate, threatening, offensive,
-or harmful.
+In our quest for uncommon creativity and top-tier talent, we're not
+coddling anyone here. Expect a friendly jab thrown your way now and
+then. No tantrums, no drama; absorb it in good humor, toss it back,
+and keep going. With exceptional talent comes thick skin.
 
-Community leaders have the right and responsibility to remove, edit, or reject
-comments, commits, code, wiki edits, issues, and other contributions that are
-not aligned to this Code of Conduct, and will communicate reasons for moderation
-decisions when appropriate.
+## **5. Do Your Own Research**
 
-## Scope
+We value tenacity and self-reliance. Figure things out, and break
+barriers. You may find yourself in uncharted waters here, facing
+unprecedented challenges. Take them head-on.
 
-This Code of Conduct applies within all community spaces, and also applies when
-an individual is officially representing the community in public spaces.
-Examples of representing our community include using an official e-mail address,
-posting via an official social media account, or acting as an appointed
-representative at an online or offline event.
+## **6. Speak Up, But Be Ready For Rebuttals**
 
-## Enforcement
+We're not trying to create a safe space; we're creating a dynamic
+one. Feel free to voice your concerns, but remember: you are in a
+space teeming with varying perspectives and you may face robust
+responses.
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-santiago@carmuega.me.
-All complaints will be reviewed and investigated promptly and fairly.
+## **7. Reporting Grave Issues**
 
-All community leaders are obligated to respect the privacy and security of the
-reporter of any incident.
+For any serious violations of this Code of Conduct, report them to
+Drex Labs. We're here to ensure that Drex Labs remains a breeding
+ground of innovative, critical thinking, free-spirited discussion, and
+above all, high-grade creativity.
 
-## Enforcement Guidelines
+By participating in the Era project, you agree to have fun, challenge
+the norms, respect this Code of Conduct and to be gutsy in your journey
+with us! Welcome aboard, let's shape the future of finance together.
 
-Community leaders will follow these Community Impact Guidelines in determining
-the consequences for any action they deem in violation of this Code of Conduct:
-
-### 1. Correction
-
-**Community Impact**: Use of inappropriate language or other behavior deemed
-unprofessional or unwelcome in the community.
-
-**Consequence**: A private, written warning from community leaders, providing
-clarity around the nature of the violation and an explanation of why the
-behavior was inappropriate. A public apology may be requested.
-
-### 2. Warning
-
-**Community Impact**: A violation through a single incident or series
-of actions.
-
-**Consequence**: A warning with consequences for continued behavior. No
-interaction with the people involved, including unsolicited interaction with
-those enforcing the Code of Conduct, for a specified period of time. This
-includes avoiding interactions in community spaces as well as external channels
-like social media. Violating these terms may lead to a temporary or
-permanent ban.
-
-### 3. Temporary Ban
-
-**Community Impact**: A serious violation of community standards, including
-sustained inappropriate behavior.
-
-**Consequence**: A temporary ban from any sort of interaction or public
-communication with the community for a specified period of time. No public or
-private interaction with the people involved, including unsolicited interaction
-with those enforcing the Code of Conduct, is allowed during this period.
-Violating these terms may lead to a permanent ban.
-
-### 4. Permanent Ban
-
-**Community Impact**: Demonstrating a pattern of violation of community
-standards, including sustained inappropriate behavior,  harassment of an
-individual, or aggression toward or disparagement of classes of individuals.
-
-**Consequence**: A permanent ban from any sort of public interaction within
-the community.
-
-## Attribution
-
-This Code of Conduct is adapted from the [Contributor Covenant][homepage],
-version 2.0, available at
-https://www.contributor-covenant.org/version/2/0/code_of_conduct.html.
-
-Community Impact Guidelines were inspired by [Mozilla's code of conduct
-enforcement ladder](https://github.com/mozilla/diversity).
-
-[homepage]: https://www.contributor-covenant.org
-
-For answers to common questions about this code of conduct, see the FAQ at
-https://www.contributor-covenant.org/faq. Translations are available at
-https://www.contributor-covenant.org/translations.
