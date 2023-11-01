@@ -1,0 +1,20 @@
+[Unit]
+Description=Era: Blockchain Indexer
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/era daemon --config /etc/era/config.toml
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=era
+Environment=RUST_LOG=WARN
+LimitNOFILE=120000
+Restart=on-failure
+RestartSec=60s
+WorkingDirectory=/
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
