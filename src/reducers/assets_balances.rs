@@ -296,21 +296,7 @@ impl Reducer {
                 .await
             }
 
-            Err(_) => match ctx.find_genesis_utxo(&mei.output_ref()) {
-                Ok(genesis_utxo) => {
-                    self.process_asset_movement(
-                        output,
-                        &hex::encode(&genesis_utxo.1.to_vec()),
-                        genesis_utxo.2,
-                        &Default::default(),
-                        !rollback,
-                        timeslot,
-                    )
-                    .await
-                }
-
-                Err(e) => Err(e),
-            },
+            Err(_) => Ok(()),
         }
     }
 

@@ -95,20 +95,8 @@ impl BlockContext {
 
         match MultiEraOutput::decode(*era, cbor) {
             Ok(on_chain_output) => Ok(BlockOrigination::Chain(on_chain_output)),
-            Err(_e) => match minicbor::decode(cbor) {
-                Ok(genesis_block_utxo) => Ok(BlockOrigination::Genesis(genesis_block_utxo)),
-                Err(e) => Err(Error::missing_utxo(e)),
-            },
+            Err(e) => Err(Error::missing_utxo(e)),
         }
-    }
-
-    pub fn find_genesis_utxo(&self, key: &OutputRef) -> Result<GenesisUtxo, Error> {
-        let (_, cbor) = self
-            .utxos
-            .get(&key.to_string())
-            .ok_or_else(|| Error::missing_utxo(key))?;
-
-        minicbor::decode(cbor).map_err(Error::cbor)
     }
 
     pub fn get_all_keys(&self) -> Vec<String> {
