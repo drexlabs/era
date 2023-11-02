@@ -165,6 +165,10 @@ pub struct MetricsSnapshot {
     enrich_status: MeteredValue,
     reducer_status: MeteredValue,
     storage_status: MeteredValue,
+    enrich_save: MeteredValue,
+    enrich_hit: MeteredValue,
+    enrich_miss: MeteredValue,
+    storage_operations: MeteredValue,
 }
 
 impl Default for MetricsSnapshot {
@@ -180,6 +184,10 @@ impl Default for MetricsSnapshot {
             enrich_status: MeteredValue::Label(Default::default()),
             reducer_status: MeteredValue::Label(Default::default()),
             storage_status: MeteredValue::Label(Default::default()),
+            enrich_save: MeteredValue::Numerical(Default::default()),
+            enrich_hit: MeteredValue::Numerical(Default::default()),
+            enrich_miss: MeteredValue::Numerical(Default::default()),
+            storage_operations: MeteredValue::Numerical(Default::default()),
         }
     }
 }
@@ -435,10 +443,8 @@ impl TuiConsole {
     async fn draw(&mut self, ctx: Option<Arc<Mutex<Context>>>, snapshot: &MetricsSnapshot) {
         let current_era = snapshot.chain_era.get_string();
 
-        let mut log_buffer_string = String::default();
-        for entry in LOG_BUFFER.all().await {
-            log_buffer_string += &format!("{} {}\n", entry.0, entry.1);
-        }
+        let log_buffer_partial = LOG_BUFFER.all().await;
+        let log_buffer_partial = log_buffer_partial.iter().rev();
 
         let mut date_string = None;
         let mut has_ctx = false;
@@ -470,6 +476,11 @@ impl TuiConsole {
                     Constraint::Length(2),
                 ])
                 .split(frame.size());
+
+            let mut log_buffer_string = String::default();
+            for entry in log_buffer_partial.rev().take(layout[1].height as usize - 2) {
+                log_buffer_string += &format!("{} {}\n", entry.0, entry.1);
+            }
 
             let top_status_layout = Layout::default()
                 .direction(Direction::Horizontal)
@@ -595,14 +606,36 @@ impl TuiConsole {
 
             match has_ctx {
                 true => {
+                    let status_sublayout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints(vec![
+                            Constraint::Length(2),
+                            Constraint::Length(1),
+                            Constraint::Min(1),
+                        ])
+                        .split(top_status_layout[1]);
+
                     let sources_status = snapshot.sources_status.get_string();
                     let enrich_status = snapshot.enrich_status.get_string();
                     let reducer_status = snapshot.reducer_status.get_string();
                     let storage_status = snapshot.storage_status.get_string();
 
                     frame.render_widget(
+                        Paragraph::new("Gasket Workers")
+                            .block(ratatui::widgets::Block::new().padding(Padding::new(
+                                0, // left
+                                0, // right
+                                0, // top
+                                0, // bottom
+                            )))
+                            .bold()
+                            .alignment(Alignment::Left),
+                        status_sublayout[1],
+                    );
+
+                    frame.render_widget(
                         Paragraph::new(format!(
-                            "{} Source\n{} Enrich\n{} Reduce\n{} Storage",
+                            "{} Source\n{} Enrich ({} hits / {} misses)\n{} Reduce\n{} Storage",
                             if sources_status.is_empty() {
                                 "⧗".to_string()
                             } else {
@@ -613,6 +646,8 @@ impl TuiConsole {
                             } else {
                                 enrich_status
                             },
+                            snapshot.enrich_hit.get_num(),
+                            snapshot.enrich_miss.get_num(),
                             if reducer_status.is_empty() {
                                 "⧗".to_string()
                             } else {
@@ -625,20 +660,20 @@ impl TuiConsole {
                             }
                         ))
                         .block(ratatui::widgets::Block::new().padding(Padding::new(
-                            1, // left
+                            0, // left
                             0, // right
-                            2, // top
+                            0, // top
                             0, // bottom
                         )))
                         .alignment(Alignment::Left),
-                        top_status_layout[1],
+                        status_sublayout[2],
                     );
                 }
                 false => {
                     frame.render_widget(
                         Paragraph::new("Opening historic block buffer...")
                             .block(ratatui::widgets::Block::new().padding(Padding::new(
-                                1, // left
+                                0, // left
                                 0, // right
                                 2, // top
                                 0, // bottom
@@ -1070,6 +1105,16 @@ impl TuiConsole {
             }
         }
 
+        if event::poll(std::time::Duration::from_millis(16)).unwrap() {
+            if let event::Event::Key(key) = event::read().unwrap() {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
+                    stdout().execute(LeaveAlternateScreen).unwrap();
+                    disable_raw_mode().unwrap();
+                    return Err(WorkerError::Panic); // todo start shut down sequence
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -1107,32 +1152,49 @@ impl PlainConsole {
     }
 
     fn refresh(&self, pipeline: Option<&super::Pipeline>) -> Result<(), WorkerError> {
-        let pipeline = pipeline.unwrap();
-        for tether in pipeline.tethers.iter() {
-            match tether.check_state() {
-                gasket::runtime::TetherState::Dropped => {
-                    log::error!("[{}] stage tether has been dropped", tether.name());
-                }
-                gasket::runtime::TetherState::Blocked(_) => {
-                    log::warn!(
-                        "[{}] stage tehter is blocked or not reporting state",
-                        tether.name(),
-                    );
-                }
-                gasket::runtime::TetherState::Alive(state) => {
-                    log::debug!("[{}] stage is alive with state: {:?}", tether.name(), state);
-                    match tether.read_metrics() {
-                        Ok(readings) => {
-                            for (key, value) in readings {
-                                log::debug!("[{}] metric `{}` = {:?}", tether.name(), key, value);
-                            }
+        match pipeline {
+            Some(pipeline) => {
+                for tether in pipeline.tethers.iter() {
+                    match tether.check_state() {
+                        gasket::runtime::TetherState::Dropped => {
+                            log::error!("[{}] stage tether has been dropped", tether.name());
                         }
-                        Err(err) => {
-                            log::error!("[{}] error reading metrics: {}", tether.name(), err)
+                        gasket::runtime::TetherState::Blocked(_) => {
+                            log::warn!(
+                                "[{}] stage tehter is blocked or not reporting state",
+                                tether.name(),
+                            );
+                        }
+                        gasket::runtime::TetherState::Alive(state) => {
+                            log::debug!(
+                                "[{}] stage is alive with state: {:?}",
+                                tether.name(),
+                                state
+                            );
+                            match tether.read_metrics() {
+                                Ok(readings) => {
+                                    for (key, value) in readings {
+                                        log::debug!(
+                                            "[{}] metric `{}` = {:?}",
+                                            tether.name(),
+                                            key,
+                                            value
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    log::error!(
+                                        "[{}] error reading metrics: {}",
+                                        tether.name(),
+                                        err
+                                    )
+                                }
+                            }
                         }
                     }
                 }
             }
+            None => {}
         }
 
         Ok(())

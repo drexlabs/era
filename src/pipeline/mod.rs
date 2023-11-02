@@ -65,7 +65,7 @@ pub struct Stage {
 #[async_trait::async_trait(?Send)]
 impl gasket::framework::Worker<Stage> for Pipeline {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
-        console::initialize(Some(stage.args_console.clone().unwrap())).await;
+        console::initialize(stage.args_console.clone()).await;
 
         console::refresh(&stage.args_console, None).await?;
 
@@ -116,7 +116,7 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             .rollback_db_path
             .clone();
 
-        log::warn!("getting latest intersection");
+        log::warn!("getting latest intersection (this may take awhile)");
 
         console::refresh(&stage.args_console, Some(&pipe)).await?;
 

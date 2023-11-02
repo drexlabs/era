@@ -219,78 +219,78 @@ impl gasket::framework::Worker<Stage> for Worker {
                     },
                     Err(_) => WorkSchedule::Idle,
                 },
-                false => {
-                    log::info!("awaiting next block (blocking)");
-                    match peer.chainsync.recv_while_must_reply().await.or_restart() {
-                        Ok(n) => {
-                            let mut blocks =
-                                match stage.ctx.lock().await.block_buffer.block_mem_take_all() {
-                                    Some(blocks) => blocks,
-                                    None => vec![],
-                                };
+                false => match peer.chainsync.recv_while_must_reply().await.or_restart() {
+                    Ok(n) => {
+                        let mut blocks =
+                            match stage.ctx.lock().await.block_buffer.block_mem_take_all() {
+                                Some(blocks) => blocks,
+                                None => vec![],
+                            };
 
-                            match n {
-                                NextResponse::RollForward(cbor, t) => {
-                                    WorkSchedule::Unit(vec![RawBlockPayload::RollForward(cbor.0)])
-                                }
-                                NextResponse::RollBackward(p, t) => {
-                                    stage
-                                        .ctx
-                                        .lock()
-                                        .await
-                                        .block_buffer
-                                        .enqueue_rollback_batch(&p);
+                        match n {
+                            NextResponse::RollForward(cbor, t) => {
+                                WorkSchedule::Unit(vec![RawBlockPayload::RollForward(cbor.0)])
+                            }
+                            NextResponse::RollBackward(p, t) => {
+                                stage
+                                    .ctx
+                                    .lock()
+                                    .await
+                                    .block_buffer
+                                    .enqueue_rollback_batch(&p);
 
-                                    loop {
-                                        let pop_rollback_block =
-                                            stage.ctx.lock().await.block_buffer.rollback_pop();
+                                loop {
+                                    let pop_rollback_block =
+                                        stage.ctx.lock().await.block_buffer.rollback_pop();
 
-                                        if let Some(last_good_block) =
-                                            stage.ctx.lock().await.block_buffer.get_block_latest()
+                                    if let Some(last_good_block) =
+                                        stage.ctx.lock().await.block_buffer.get_block_latest()
+                                    {
+                                        if let Ok(parsed_last_good_block) =
+                                            MultiEraBlock::decode(&last_good_block)
                                         {
-                                            if let Ok(parsed_last_good_block) =
-                                                MultiEraBlock::decode(&last_good_block)
-                                            {
-                                                let last_good_point = Point::Specific(
-                                                    parsed_last_good_block.slot(),
-                                                    parsed_last_good_block.hash().to_vec(),
-                                                );
+                                            let last_good_point = Point::Specific(
+                                                parsed_last_good_block.slot(),
+                                                parsed_last_good_block.hash().to_vec(),
+                                            );
 
-                                                if let Some(rollback_cbor) = pop_rollback_block {
-                                                    blocks.push(RawBlockPayload::RollBack(
-                                                        rollback_cbor.clone(),
-                                                        (
-                                                            last_good_point,
-                                                            parsed_last_good_block.number(),
-                                                        ),
-                                                    ));
-                                                } else {
-                                                    break;
-                                                }
-                                            }
-                                        } else {
                                             if let Some(rollback_cbor) = pop_rollback_block {
                                                 blocks.push(RawBlockPayload::RollBack(
                                                     rollback_cbor.clone(),
-                                                    (Point::Origin, 0),
+                                                    (
+                                                        last_good_point,
+                                                        parsed_last_good_block.number(),
+                                                    ),
                                                 ));
                                             } else {
                                                 break;
                                             }
                                         }
-                                    }
-
-                                    match blocks.len() > 0 {
-                                        true => WorkSchedule::Unit(blocks),
-                                        false => WorkSchedule::Idle,
+                                    } else {
+                                        if let Some(rollback_cbor) = pop_rollback_block {
+                                            blocks.push(RawBlockPayload::RollBack(
+                                                rollback_cbor.clone(),
+                                                (Point::Origin, 0),
+                                            ));
+                                        } else {
+                                            break;
+                                        }
                                     }
                                 }
-                                NextResponse::Await => WorkSchedule::Idle,
+
+                                match blocks.len() > 0 {
+                                    true => WorkSchedule::Unit(blocks),
+                                    false => WorkSchedule::Idle,
+                                }
                             }
+                            NextResponse::Await => WorkSchedule::Idle,
                         }
-                        Err(_) => WorkSchedule::Idle,
                     }
-                }
+                    Err(_) => {
+                        log::info!("ready for next block");
+                        WorkSchedule::Idle
+                    }
+                },
             },
         })
     }
