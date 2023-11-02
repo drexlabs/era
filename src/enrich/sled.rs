@@ -6,6 +6,7 @@ use gasket::messaging::tokio::{InputPort, OutputPort};
 
 use pallas::ledger::configs::byron::{genesis_utxos, GenesisUtxo};
 
+use pallas::ledger::traverse::MultiEraOutput;
 use pallas::{
     codec::minicbor,
     ledger::traverse::{Era, MultiEraBlock, MultiEraTx, OutputRef},
@@ -92,7 +93,7 @@ fn fetch_referenced_utxo<'a>(
 
         Ok(Some((utxo_ref.clone(), era, cbor)))
     } else {
-        Ok(None)
+        Err(Error::MissingUtxo(utxo_ref.to_string()))
     }
 }
 
@@ -148,15 +149,23 @@ impl Worker {
         genesis_utxo: &GenesisUtxo,
         inserts: &gasket::metrics::Counter,
     ) -> Result<(), crate::Error> {
-        let mut encoded_genesis_utxo = vec![];
+        let address = pallas_primitives::byron::Address {
+            payload: genesis_utxo.1.payload.clone(),
+            crc: genesis_utxo.1.crc,
+        };
 
-        minicbor::encode(genesis_utxo, &mut encoded_genesis_utxo).unwrap();
+        let byron_output = pallas_primitives::byron::TxOut {
+            address,
+            amount: genesis_utxo.2,
+        };
 
-        let value: IVec = SledTxValue(0, encoded_genesis_utxo).try_into()?;
+        let byron_txo = MultiEraOutput::from_byron(&byron_output);
+
+        let value: IVec = SledTxValue(Era::Byron as u16, byron_txo.encode()).try_into()?;
 
         inserts.inc(1);
 
-        db.insert(format!("{}#{}", genesis_utxo.0, "0").as_bytes(), value)
+        db.insert(format!("{}#0", genesis_utxo.0).as_bytes(), value)
             .map_err(Error::storage)?;
 
         Ok(())
@@ -206,16 +215,21 @@ impl Worker {
             .map(|utxo_ref| fetch_referenced_utxo(db, utxo_ref))
             .collect();
 
-        for result in matches.unwrap() {
-            match result {
-                Some((key, era, cbor)) => {
-                    ctx.import_ref_output(&key, era, cbor);
-                    match_count += 1;
-                }
-                None => {
-                    mismatch_count += 1;
+        match matches {
+            Ok(results) => {
+                for result in results {
+                    match result {
+                        Some((key, era, cbor)) => {
+                            ctx.import_ref_output(&key, era, cbor);
+                            match_count += 1;
+                        }
+                        None => {
+                            mismatch_count += 1;
+                        }
+                    }
                 }
             }
+            Err(_) => mismatch_count += txs.len() as u64,
         }
 
         (ctx, match_count, mismatch_count)
