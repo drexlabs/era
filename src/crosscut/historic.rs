@@ -56,7 +56,7 @@ impl BufferBlocks {
             .open()
             .unwrap();
 
-        log::error!("opened block buffer db");
+        log::info!("sled: block buffer db opened");
         let queue: Vec<(String, Vec<u8>)> = Vec::default();
 
         BufferBlocks {

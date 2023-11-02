@@ -116,9 +116,15 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             .rollback_db_path
             .clone();
 
+        log::warn!("getting latest intersection");
+
+        console::refresh(&stage.args_console, Some(&pipe)).await?;
+
         let mut enrich_stage = enrich
             .bootstrapper(pipe.ctx.clone(), rollback_db_path)
             .unwrap();
+
+        console::refresh(&stage.args_console, Some(&pipe)).await?;
 
         let enrich_input_port = enrich_stage.borrow_input_port();
 
