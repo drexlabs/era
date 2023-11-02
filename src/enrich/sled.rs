@@ -163,10 +163,10 @@ impl Worker {
 
         let value: IVec = SledTxValue(Era::Byron as u16, byron_txo.encode()).try_into()?;
 
-        inserts.inc(1);
-
         db.insert(format!("{}#0", genesis_utxo.0).as_bytes(), value)
             .map_err(Error::storage)?;
+
+        inserts.inc(1);
 
         Ok(())
     }
