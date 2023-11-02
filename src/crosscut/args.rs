@@ -1,9 +1,11 @@
+use pallas::ledger::traverse::wellknown::GenesisValues;
 use pallas::network::miniprotocols::{
     Point,
     MAINNET_MAGIC,
     TESTNET_MAGIC,
     // PREVIEW_MAGIC, PRE_PRODUCTION_MAGIC,
 };
+
 use serde::{Deserialize, Serialize};
 use std::{ops::Deref, str::FromStr};
 
@@ -39,6 +41,34 @@ impl From<Point> for PointArg {
         match other {
             Point::Origin => PointArg::Origin,
             Point::Specific(slot, hash) => PointArg::Specific(slot, hex::encode(hash)),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum ChainConfig {
+    Mainnet,
+    Testnet,
+    PreProd,
+    Preview,
+    Custom(GenesisValues),
+}
+
+impl Default for ChainConfig {
+    fn default() -> Self {
+        Self::Mainnet
+    }
+}
+
+impl From<ChainConfig> for GenesisValues {
+    fn from(other: ChainConfig) -> Self {
+        match other {
+            ChainConfig::Mainnet => GenesisValues::mainnet(),
+            ChainConfig::Testnet => GenesisValues::testnet(),
+            ChainConfig::PreProd => GenesisValues::preprod(),
+            ChainConfig::Preview => GenesisValues::preview(),
+            ChainConfig::Custom(x) => x,
         }
     }
 }

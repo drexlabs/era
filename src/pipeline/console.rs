@@ -1,8 +1,4 @@
-use std::default;
-use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
-
+use chrono::Duration as ChronoDuration;
 use chrono::{DateTime, Utc};
 use crossterm::style::Colors;
 use gasket::{
@@ -14,6 +10,10 @@ use lazy_static::{__Deref, lazy_static};
 use log::Log;
 use ratatui::prelude::Layout;
 use ratatui::widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, Padding};
+use std::default;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
@@ -28,6 +28,34 @@ use crossterm::{
 };
 use ratatui::{prelude::*, widgets::Paragraph};
 use std::io::{stdout, Stdout};
+
+fn friendly_duration(seconds: i64) -> String {
+    let duration = ChronoDuration::seconds(seconds);
+    let days = duration.num_days();
+    let hours = duration.num_hours() % 24;
+    let minutes = duration.num_minutes() % 60;
+
+    if days > 0 {
+        format!("{} days and {} hours", days, hours)
+    } else if hours > 0 {
+        format!("{} hours and {} minutes", hours, minutes)
+    } else if minutes > 0 {
+        format!("{} minutes", minutes)
+    } else {
+        format!("{} seconds", seconds)
+    }
+}
+
+fn remaining_time(rate_per_second: f64, total_items: i64, processed_items: i64) -> String {
+    if rate_per_second == 0.0 {
+        return "∞".to_string();
+    }
+
+    let remaining_items = (total_items - processed_items) as f64;
+    let remaining_seconds = (remaining_items / rate_per_second).ceil() as i64;
+
+    friendly_duration(remaining_seconds)
+}
 
 #[derive(clap::ValueEnum, Clone)]
 pub enum Mode {
@@ -67,9 +95,7 @@ struct MeteredString {
 
 impl Default for MeteredString {
     fn default() -> Self {
-        Self {
-            value: "Byron".into(),
-        }
+        Self { value: "".into() }
     }
 }
 
@@ -119,7 +145,7 @@ impl MeteredValue {
         }
     }
 
-    pub fn get_str(&self) -> String {
+    pub fn get_string(&self) -> String {
         match self {
             MeteredValue::Numerical(_) => "".into(),
             MeteredValue::Label(metered_string) => metered_string.value.clone(),
@@ -406,20 +432,29 @@ impl TuiConsole {
         }
     }
 
-    async fn draw(&mut self, ctx: Arc<Mutex<Context>>, snapshot: &MetricsSnapshot) {
-        let current_era = snapshot.chain_era.get_str();
+    async fn draw(&mut self, ctx: Option<Arc<Mutex<Context>>>, snapshot: &MetricsSnapshot) {
+        let current_era = snapshot.chain_era.get_string();
 
         let mut log_buffer_string = String::default();
         for entry in LOG_BUFFER.all().await {
             log_buffer_string += &format!("{} {}\n", entry.0, entry.1);
         }
 
-        let time_provider = crosscut::time::NaiveProvider::new(ctx).await;
-        let block_time = time_provider.slot_to_wallclock(snapshot.chain_bar_progress.get_num());
+        let mut date_string = None;
+        let mut has_ctx = false;
 
-        let d = SystemTime::UNIX_EPOCH + Duration::from_secs(block_time);
-        let datetime = DateTime::<Utc>::from(d);
-        let date_string = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+        match ctx {
+            Some(ctx) => {
+                let provider = crosscut::time::NaiveProvider::new(ctx.clone()).await;
+                let wallclock = provider.slot_to_wallclock(snapshot.chain_bar_progress.get_num());
+                let d = SystemTime::UNIX_EPOCH + Duration::from_secs(wallclock);
+                let datetime = DateTime::<Utc>::from(d);
+                date_string = Some(datetime.format("%Y-%m-%d %H:%M:%S").to_string());
+                has_ctx = true;
+            }
+
+            None => {}
+        }
 
         self.terminal.draw(|frame| {
             let layout = Layout::default()
@@ -518,7 +553,7 @@ impl TuiConsole {
             );
 
             frame.render_widget(
-                Paragraph::new(snapshot.chain_era.get_str())
+                Paragraph::new(snapshot.chain_era.get_string())
                     .block(ratatui::widgets::Block::new().padding(Padding::new(
                         0, // left
                         1, // right
@@ -532,10 +567,10 @@ impl TuiConsole {
             let progress_footer_layout = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints(vec![
-                    Constraint::Length(progress_layout[0].width - 1),
+                    Constraint::Length(progress_layout[2].width - 1),
                     Constraint::Max(20),
                     Constraint::Min(10),
-                    Constraint::Length(14),
+                    Constraint::Length(progress_layout[2].width - 1),
                 ])
                 .split(layout[7]);
 
@@ -558,23 +593,61 @@ impl TuiConsole {
             //     layout[1],
             // );
 
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "{} Source\n{} Enrich\n{} Reduce\n{} Storage",
-                    snapshot.sources_status.get_str(),
-                    snapshot.enrich_status.get_str(),
-                    snapshot.reducer_status.get_str(),
-                    snapshot.storage_status.get_str()
-                ))
-                .block(ratatui::widgets::Block::new().padding(Padding::new(
-                    1, // left
-                    0, // right
-                    2, // top
-                    0, // bottom
-                )))
-                .alignment(Alignment::Left),
-                top_status_layout[1],
-            );
+            match has_ctx {
+                true => {
+                    let sources_status = snapshot.sources_status.get_string();
+                    let enrich_status = snapshot.enrich_status.get_string();
+                    let reducer_status = snapshot.reducer_status.get_string();
+                    let storage_status = snapshot.storage_status.get_string();
+
+                    frame.render_widget(
+                        Paragraph::new(format!(
+                            "{} Source\n{} Enrich\n{} Reduce\n{} Storage",
+                            if sources_status.is_empty() {
+                                "⧗".to_string()
+                            } else {
+                                sources_status
+                            },
+                            if enrich_status.is_empty() {
+                                "⚠".to_string()
+                            } else {
+                                enrich_status
+                            },
+                            if reducer_status.is_empty() {
+                                "⧗".to_string()
+                            } else {
+                                reducer_status
+                            },
+                            if storage_status.is_empty() {
+                                "⧗".to_string()
+                            } else {
+                                storage_status
+                            }
+                        ))
+                        .block(ratatui::widgets::Block::new().padding(Padding::new(
+                            1, // left
+                            0, // right
+                            2, // top
+                            0, // bottom
+                        )))
+                        .alignment(Alignment::Left),
+                        top_status_layout[1],
+                    );
+                }
+                false => {
+                    frame.render_widget(
+                        Paragraph::new("Opening historic block buffer...")
+                            .block(ratatui::widgets::Block::new().padding(Padding::new(
+                                1, // left
+                                0, // right
+                                2, // top
+                                0, // bottom
+                            )))
+                            .alignment(Alignment::Left),
+                        top_status_layout[1],
+                    );
+                }
+            }
 
             // frame.render_widget(
             //     Paragraph::new(snapshot.chain_bar_progress.get_str())
@@ -602,17 +675,23 @@ impl TuiConsole {
                 progress_layout[2],
             );
 
-            frame.render_widget(
-                Paragraph::new(date_string)
-                    .block(Block::new().padding(Padding::new(
-                        1, // left
-                        0, // right
-                        0, // top
-                        0, // bottom
-                    )))
-                    .alignment(Alignment::Left),
-                progress_footer_layout[1],
-            );
+            match date_string {
+                Some(date_string) => {
+                    frame.render_widget(
+                        Paragraph::new(date_string)
+                            .block(Block::new().padding(Padding::new(
+                                1, // left
+                                0, // right
+                                0, // top
+                                0, // bottom
+                            )))
+                            .alignment(Alignment::Left),
+                        progress_footer_layout[1],
+                    );
+                }
+
+                None => {}
+            }
 
             // frame.render_widget(
             //     Paragraph::new(format!(
@@ -628,6 +707,29 @@ impl TuiConsole {
             let chain_bar_progress_metrics = self
                 .metrics_buffer
                 .rates_for_snapshot_prop("blocks_processed");
+
+            let time_remaining = match snapshot.chain_bar_depth.get_num() > 0
+                && snapshot.chain_bar_progress.get_num() > 0
+            {
+                true => remaining_time(
+                    chain_bar_progress_metrics.last().unwrap_or(&(0.0, 0.0)).1, // todo make 0 and handle
+                    snapshot.chain_bar_depth.get_num() as i64,
+                    snapshot.chain_bar_progress.get_num() as i64,
+                ),
+                false => 0.0.to_string(),
+            };
+
+            frame.render_widget(
+                Paragraph::new(format!("{} remaining", time_remaining))
+                    .block(Block::new().padding(Padding::new(
+                        0, // left
+                        1, // right
+                        0, // top
+                        0, // bottom
+                    )))
+                    .alignment(Alignment::Right),
+                progress_footer_layout[2],
+            );
 
             let chain_bar_window = self
                 .metrics_buffer
@@ -831,11 +933,7 @@ impl TuiConsole {
         });
     }
 
-    async fn refresh(
-        &mut self,
-        ctx: Arc<Mutex<Context>>,
-        pipeline: &super::Pipeline,
-    ) -> Result<(), WorkerError> {
+    async fn refresh(&mut self, pipeline: Option<&super::Pipeline>) -> Result<(), WorkerError> {
         let mut snapshot = MetricsSnapshot::default();
         snapshot.timestamp = Instant::now().duration_since(self.metrics_buffer.base_time);
 
@@ -851,111 +949,126 @@ impl TuiConsole {
         //     _ => {}
         // }
 
-        for tether in pipeline.tethers.iter() {
-            let state = match tether.check_state() {
-                TetherState::Dropped => "dropped!",
-                TetherState::Blocked(_) => "blocked",
-                TetherState::Alive(a) => match a {
-                    StagePhase::Bootstrap => "⚠",
-                    StagePhase::Working => "⚙",
-                    StagePhase::Teardown => "⚠",
-                    StagePhase::Ended => "ended",
-                },
-            };
+        match pipeline {
+            Some(pipeline) => {
+                for tether in pipeline.tethers.iter() {
+                    let state = match tether.check_state() {
+                        TetherState::Dropped => "dropped!",
+                        TetherState::Blocked(_) => "blocked",
+                        TetherState::Alive(a) => match a {
+                            StagePhase::Bootstrap => "⚠",
+                            StagePhase::Working => "⚙",
+                            StagePhase::Teardown => "⚠",
+                            StagePhase::Ended => "ended",
+                        },
+                    };
 
-            if state == "blocked" {
-                log::warn!("{} is blocked", tether.name());
-            }
+                    if state == "blocked" {
+                        log::warn!("{} is blocked", tether.name());
+                    }
 
-            let tether_type: StageTypes = tether.name().into();
+                    let tether_type: StageTypes = tether.name().into();
 
-            match tether_type {
-                StageTypes::Source => snapshot.sources_status = MeteredValue::Label(state.into()),
-                StageTypes::Enrich => snapshot.enrich_status = MeteredValue::Label(state.into()),
-                StageTypes::Reduce => snapshot.reducer_status = MeteredValue::Label(state.into()),
-                StageTypes::Storage => snapshot.storage_status = MeteredValue::Label(state.into()),
-                StageTypes::Unknown => {}
-            }
+                    match tether_type {
+                        StageTypes::Source => {
+                            snapshot.sources_status = MeteredValue::Label(state.into())
+                        }
+                        StageTypes::Enrich => {
+                            snapshot.enrich_status = MeteredValue::Label(state.into())
+                        }
+                        StageTypes::Reduce => {
+                            snapshot.reducer_status = MeteredValue::Label(state.into())
+                        }
+                        StageTypes::Storage => {
+                            snapshot.storage_status = MeteredValue::Label(state.into())
+                        }
+                        StageTypes::Unknown => {}
+                    }
 
-            match tether.read_metrics() {
-                Ok(readings) => {
-                    for (key, value) in readings {
-                        match (tether.name(), key, value) {
-                            (_, "chain_tip", Reading::Gauge(x)) => {
-                                snapshot.chain_bar_depth.set_num(x as u64);
-                            }
-                            (_, "last_block", Reading::Gauge(x)) => {
-                                snapshot.chain_bar_progress.set_num(x as u64);
-                            }
-                            (_, "blocks_processed", Reading::Count(x)) => {
-                                snapshot.blocks_processed.set_num(x as u64);
-                            }
-                            // (_, "received_blocks", Reading::Count(x)) => {
-                            //     self.received_blocks.set_position(x);
-                            //     self.received_blocks.set_message(state);
-                            // }
-                            // (_, "ops_count", Reading::Count(x)) => {
-                            //     self.reducer_ops_count.set_position(x);
-                            //     self.reducer_ops_count.set_message(state);
-                            // }
-                            // (_, "reducer_errors", Reading::Count(x)) => {
-                            //     self.reducer_errors.set_position(x);
-                            //     self.reducer_errors.set_message(state);
-                            // }
-                            // (_, "storage_ops", Reading::Count(x)) => {
-                            //     self.storage_ops_count.set_position(x);
-                            //     self.storage_ops_count.set_message(state);
-                            // }
-                            (_, "transactions_finalized", Reading::Count(x)) => {
-                                snapshot.transactions.set_num(x as u64);
-                            }
-                            // (_, "enrich_cancelled_empty_tx", Reading::Count(x)) => {
-                            //     self.enrich_skipped_empty.set_position(x);
-                            //     self.enrich_skipped_empty.set_message(state);
-                            // }
-                            // (_, "enrich_removes", Reading::Count(x)) => {
-                            //     self.enrich_removes.set_position(x);
-                            //     self.enrich_removes.set_message(state);
-                            // }
-                            // (_, "enrich_matches", Reading::Count(x)) => {
-                            //     self.enrich_matches.set_position(x);
-                            //     self.enrich_matches.set_message(state);
-                            // }
-                            // (_, "enrich_mismatches", Reading::Count(x)) => {
-                            //     self.enrich_mismatches.set_position(x);
-                            //     self.enrich_mismatches.set_message(state);
-                            // }
-                            // (_, "enrich_blocks", Reading::Count(x)) => {
-                            //     self.enrich_blocks.set_position(x);
-                            //     self.enrich_blocks.set_message(state);
-                            // }
-                            // (_, "historic_blocks", Reading::Count(x)) => {
-                            //     self.historic_blocks.set_position(x);
-                            //     self.historic_blocks.set_message("");
-                            // }
-                            // (_, "historic_blocks_removed", Reading::Count(x)) => {
-                            //     self.historic_blocks_removed.set_position(x);
-                            //     self.historic_blocks_removed.set_message("");
-                            // }
-                            (_, "chain_era", Reading::Gauge(x)) => {
-                                if x > 0 {
-                                    snapshot.chain_era.set_str(i64_to_string(x).as_str());
+                    match tether.read_metrics() {
+                        Ok(readings) => {
+                            for (key, value) in readings {
+                                match (tether.name(), key, value) {
+                                    (_, "chain_tip", Reading::Gauge(x)) => {
+                                        snapshot.chain_bar_depth.set_num(x as u64);
+                                    }
+                                    (_, "last_block", Reading::Gauge(x)) => {
+                                        snapshot.chain_bar_progress.set_num(x as u64);
+                                    }
+                                    (_, "blocks_processed", Reading::Count(x)) => {
+                                        snapshot.blocks_processed.set_num(x as u64);
+                                    }
+                                    // (_, "received_blocks", Reading::Count(x)) => {
+                                    //     self.received_blocks.set_position(x);
+                                    //     self.received_blocks.set_message(state);
+                                    // }
+                                    // (_, "ops_count", Reading::Count(x)) => {
+                                    //     self.reducer_ops_count.set_position(x);
+                                    //     self.reducer_ops_count.set_message(state);
+                                    // }
+                                    // (_, "reducer_errors", Reading::Count(x)) => {
+                                    //     self.reducer_errors.set_position(x);
+                                    //     self.reducer_errors.set_message(state);
+                                    // }
+                                    // (_, "storage_ops", Reading::Count(x)) => {
+                                    //     self.storage_ops_count.set_position(x);
+                                    //     self.storage_ops_count.set_message(state);
+                                    // }
+                                    (_, "transactions_finalized", Reading::Count(x)) => {
+                                        snapshot.transactions.set_num(x as u64);
+                                    }
+                                    // (_, "enrich_cancelled_empty_tx", Reading::Count(x)) => {
+                                    //     self.enrich_skipped_empty.set_position(x);
+                                    //     self.enrich_skipped_empty.set_message(state);
+                                    // }
+                                    // (_, "enrich_removes", Reading::Count(x)) => {
+                                    //     self.enrich_removes.set_position(x);
+                                    //     self.enrich_removes.set_message(state);
+                                    // }
+                                    // (_, "enrich_matches", Reading::Count(x)) => {
+                                    //     self.enrich_matches.set_position(x);
+                                    //     self.enrich_matches.set_message(state);
+                                    // }
+                                    // (_, "enrich_mismatches", Reading::Count(x)) => {
+                                    //     self.enrich_mismatches.set_position(x);
+                                    //     self.enrich_mismatches.set_message(state);
+                                    // }
+                                    // (_, "enrich_blocks", Reading::Count(x)) => {
+                                    //     self.enrich_blocks.set_position(x);
+                                    //     self.enrich_blocks.set_message(state);
+                                    // }
+                                    // (_, "historic_blocks", Reading::Count(x)) => {
+                                    //     self.historic_blocks.set_position(x);
+                                    //     self.historic_blocks.set_message("");
+                                    // }
+                                    // (_, "historic_blocks_removed", Reading::Count(x)) => {
+                                    //     self.historic_blocks_removed.set_position(x);
+                                    //     self.historic_blocks_removed.set_message("");
+                                    // }
+                                    (_, "chain_era", Reading::Gauge(x)) => {
+                                        if x > 0 {
+                                            snapshot.chain_era.set_str(i64_to_string(x).as_str());
+                                        }
+                                    }
+                                    _ => (),
                                 }
                             }
-                            _ => (),
                         }
-                    }
+                        Err(_) => {
+                            log::warn!("couldn't read metrics");
+                        }
+                    };
                 }
-                Err(_) => {
-                    log::warn!("couldn't read metrics");
-                }
-            };
+
+                // Clean up
+
+                self.draw(Some(pipeline.ctx.clone()), &snapshot).await;
+                self.metrics_buffer.push(snapshot);
+            }
+            None => {
+                self.draw(None, &snapshot).await;
+            }
         }
-
-        // Clean up
-
-        self.draw(ctx, &snapshot).await;
-        self.metrics_buffer.push(snapshot);
 
         Ok(())
     }
@@ -993,7 +1106,8 @@ impl PlainConsole {
         }
     }
 
-    fn refresh(&self, pipeline: &super::Pipeline) -> Result<(), WorkerError> {
+    fn refresh(&self, pipeline: Option<&super::Pipeline>) -> Result<(), WorkerError> {
+        let pipeline = pipeline.unwrap();
         for tether in pipeline.tethers.iter() {
             match tether.check_state() {
                 gasket::runtime::TetherState::Dropped => {
@@ -1091,12 +1205,11 @@ pub async fn initialize(mode: Option<Mode>) {
 }
 
 pub async fn refresh(
-    ctx: Arc<Mutex<Context>>,
     mode: &Option<Mode>,
-    pipeline: &super::Pipeline,
+    pipeline: Option<&super::Pipeline>,
 ) -> Result<(), WorkerError> {
     let mode = match mode {
-        Some(Mode::TUI) => TUI_CONSOLE.lock().await.refresh(ctx, pipeline).await,
+        Some(Mode::TUI) => TUI_CONSOLE.lock().await.refresh(pipeline).await,
         _ => PLAIN_CONSOLE.refresh(pipeline),
     };
 

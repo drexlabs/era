@@ -10,7 +10,10 @@ use gasket::{
     retries,
     runtime::{spawn_stage, Policy, StagePhase, Tether, TetherState},
 };
-use pallas::ledger::{configs::byron::GenesisFile, traverse::wellknown::GenesisValues};
+use pallas::ledger::{
+    configs::byron::{from_file, GenesisFile},
+    traverse::wellknown::GenesisValues,
+};
 use tokio::sync::Mutex;
 
 pub enum StageTypes {
@@ -46,10 +49,15 @@ impl std::convert::From<&str> for StageTypes {
 #[derive(Stage)]
 #[stage(name = "pipeline-bootstrapper", unit = "()", worker = "Pipeline")]
 pub struct Stage {
-    pub ctx: Arc<Mutex<Context>>,
+    pub chain_config: Option<crosscut::ChainConfig>,
+    pub genesis_config: Option<String>,
+    pub intersect_config: crosscut::IntersectConfig,
+    pub finalize_config: Option<crosscut::FinalizeConfig>,
+    pub policy_config: Option<crosscut::policies::RuntimePolicy>,
+    pub blocks_config: Option<crosscut::historic::BlockConfig>,
     pub sources_config: Option<sources::Config>,
     pub enrich_config: Option<enrich::Config>,
-    pub reducer_config: Option<Vec<reducers::Config>>,
+    pub reducer_config: Vec<reducers::Config>,
     pub storage_config: Option<storage::Config>,
     pub args_console: Option<console::Mode>,
 }
@@ -59,7 +67,32 @@ impl gasket::framework::Worker<Stage> for Pipeline {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
         console::initialize(Some(stage.args_console.clone().unwrap())).await;
 
+        console::refresh(&stage.args_console, None).await?;
+
         let mut pipe = Self {
+            ctx: Arc::new(Mutex::new(Context {
+                chain: stage.chain_config.clone().unwrap_or_default().into(),
+                intersect: stage.intersect_config.clone().into(),
+                finalize: match stage.finalize_config.clone() {
+                    Some(finalize_config) => Some(finalize_config.into()),
+                    None => None,
+                },
+                error_policy: stage.policy_config.clone().unwrap_or_default(),
+                block_buffer: stage.blocks_config.clone().unwrap_or_default().into(),
+                genesis_file: from_file(std::path::Path::new(
+                    &stage.genesis_config.clone().unwrap_or(format!(
+                        "/etc/era/{}-byron-genesis.json",
+                        match stage.chain_config.clone().unwrap_or_default() {
+                            crosscut::ChainConfig::Mainnet => "mainnet",
+                            crosscut::ChainConfig::Testnet => "testnet",
+                            crosscut::ChainConfig::PreProd => "preprod",
+                            crosscut::ChainConfig::Preview => "preview",
+                            _ => "",
+                        }
+                    )),
+                ))
+                .unwrap(),
+            })),
             policy: Policy {
                 tick_timeout: None,
                 bootstrap_retry: retries::Policy::default(),
@@ -70,11 +103,11 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             tethers: Default::default(),
         };
 
-        console::refresh(stage.ctx.clone(), &stage.args_console, &pipe).await?;
+        console::refresh(&stage.args_console, Some(&pipe)).await?;
 
         let enrich = stage.enrich_config.clone().unwrap();
 
-        let rollback_db_path = stage
+        let rollback_db_path = pipe
             .ctx
             .lock()
             .await
@@ -84,23 +117,23 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             .clone();
 
         let mut enrich_stage = enrich
-            .bootstrapper(stage.ctx.clone(), rollback_db_path)
+            .bootstrapper(pipe.ctx.clone(), rollback_db_path)
             .unwrap();
 
         let enrich_input_port = enrich_stage.borrow_input_port();
 
         let storage = stage.storage_config.as_ref().unwrap();
-        let mut storage_stage = storage.clone().bootstrapper(stage.ctx.clone()).unwrap();
+        let mut storage_stage = storage.clone().bootstrapper(pipe.ctx.clone()).unwrap();
 
         let source = stage.sources_config.as_ref().unwrap();
         let mut source_stage = source
             .clone()
-            .bootstrapper(stage.ctx.clone(), storage_stage.build_cursor())
+            .bootstrapper(pipe.ctx.clone(), storage_stage.build_cursor())
             .unwrap();
 
         let mut reducer = reducers::worker::bootstrap(
-            stage.ctx.clone(),
-            stage.reducer_config.clone().unwrap(),
+            pipe.ctx.clone(),
+            stage.reducer_config.clone(),
             storage_stage.borrow_input_port(),
         );
 
@@ -158,13 +191,14 @@ impl gasket::framework::Worker<Stage> for Pipeline {
     }
 
     async fn execute(&mut self, _: &(), stage: &mut Stage) -> Result<(), WorkerError> {
-        console::refresh(stage.ctx.clone(), &stage.args_console, self).await
+        console::refresh(&stage.args_console, Some(self)).await
     }
 }
 
 pub struct Pipeline {
     pub policy: Policy,
     pub tethers: Vec<Tether>,
+    pub ctx: Arc<Mutex<Context>>,
 }
 
 pub fn i64_to_string(mut i: i64) -> String {
@@ -182,20 +216,30 @@ pub fn i64_to_string(mut i: i64) -> String {
 
 impl Pipeline {
     pub fn bootstrap(
-        ctx: Arc<Mutex<Context>>,
-        sources_config: sources::Config,
-        enrich_config: enrich::Config,
+        chain_config: Option<crosscut::ChainConfig>,
+        intersect_config: crosscut::IntersectConfig,
+        genesis_config: Option<String>,
+        finalize_config: Option<crosscut::FinalizeConfig>,
+        policy_config: Option<crosscut::policies::RuntimePolicy>,
+        blocks_config: Option<crosscut::historic::BlockConfig>,
+        sources_config: Option<sources::Config>,
+        enrich_config: Option<enrich::Config>,
         reducer_config: Vec<reducers::Config>,
-        storage_config: storage::Config,
-        args_console: console::Mode,
+        storage_config: Option<storage::Config>,
+        args_console: Option<console::Mode>,
     ) -> Stage {
         Stage {
-            ctx,
-            sources_config: Some(sources_config),
-            storage_config: Some(storage_config),
-            enrich_config: Some(enrich_config),
-            reducer_config: Some(reducer_config),
-            args_console: Some(args_console),
+            chain_config,
+            intersect_config,
+            genesis_config,
+            finalize_config,
+            policy_config,
+            blocks_config,
+            sources_config,
+            storage_config,
+            enrich_config,
+            reducer_config,
+            args_console,
         }
     }
 

@@ -11,34 +11,6 @@ use pallas::ledger::{configs::byron::from_file, traverse::wellknown::GenesisValu
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-#[derive(Deserialize, Clone)]
-#[serde(tag = "type")]
-pub enum ChainConfig {
-    Mainnet,
-    Testnet,
-    PreProd,
-    Preview,
-    Custom(GenesisValues),
-}
-
-impl Default for ChainConfig {
-    fn default() -> Self {
-        Self::Mainnet
-    }
-}
-
-impl From<ChainConfig> for GenesisValues {
-    fn from(other: ChainConfig) -> Self {
-        match other {
-            ChainConfig::Mainnet => GenesisValues::mainnet(),
-            ChainConfig::Testnet => GenesisValues::testnet(),
-            ChainConfig::PreProd => GenesisValues::preprod(),
-            ChainConfig::Preview => GenesisValues::preview(),
-            ChainConfig::Custom(x) => x,
-        }
-    }
-}
-
 #[derive(Deserialize)]
 struct ConfigRoot {
     source: sources::Config,
@@ -47,7 +19,7 @@ struct ConfigRoot {
     storage: storage::Config,
     intersect: crosscut::IntersectConfig,
     finalize: Option<crosscut::FinalizeConfig>,
-    chain: Option<ChainConfig>,
+    chain: Option<crosscut::ChainConfig>,
     blocks: Option<crosscut::historic::BlockConfig>,
     policy: Option<crosscut::policies::RuntimePolicy>,
     genesis: Option<String>,
@@ -79,33 +51,19 @@ pub fn run(args: &Args) -> Result<(), era::Error> {
     let config = ConfigRoot::new(&args.config)
         .map_err(|err| era::Error::ConfigError(format!("{:?}", err)))?;
 
-    let chain_config = config.chain.unwrap_or_default();
-
     spawn_stage(
         pipeline::Pipeline::bootstrap(
-            Arc::new(Mutex::new(Context {
-                chain: chain_config.clone().into(),
-                intersect: config.intersect,
-                finalize: config.finalize,
-                error_policy: config.policy.unwrap_or_default(),
-                block_buffer: config.blocks.unwrap().into(),
-                genesis_file: from_file(std::path::Path::new(&config.genesis.unwrap_or(format!(
-                    "/etc/era/{}-byron-genesis.json",
-                    match chain_config {
-                        ChainConfig::Mainnet => "mainnet",
-                        ChainConfig::Testnet => "testnet",
-                        ChainConfig::PreProd => "preprod",
-                        ChainConfig::Preview => "preview",
-                        _ => "",
-                    }
-                ))))
-                .unwrap(),
-            })),
-            config.source,
-            config.enrich.unwrap_or_default(),
+            config.chain,
+            config.intersect,
+            config.genesis,
+            config.finalize,
+            config.policy,
+            config.blocks,
+            Some(config.source),
+            config.enrich,
             config.reducers,
-            config.storage,
-            args.console.clone().unwrap_or_default(),
+            Some(config.storage),
+            args.console.clone(),
         ),
         Default::default(), // todo dont use default policy
     );
