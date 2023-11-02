@@ -322,8 +322,6 @@ impl Reducer {
         rollback: bool,
         output: Arc<Mutex<OutputPort<CRDTCommand>>>,
     ) -> Result<(), gasket::framework::WorkerError> {
-        let error_policy = self.ctx.lock().await.error_policy.clone();
-
         match (block, block_ctx, genesis_utxos) {
             (Some(block), Some(block_ctx), _) => {
                 let slot = block.slot();
@@ -339,7 +337,6 @@ impl Reducer {
                             time_provider.slot_to_wallclock(slot),
                         )
                         .await
-                        .apply_policy(&error_policy)
                         .or_panic()?;
                     }
 
@@ -352,7 +349,6 @@ impl Reducer {
                             time_provider.slot_to_wallclock(slot),
                         )
                         .await
-                        .apply_policy(&error_policy)
                         .or_panic()?;
                     }
                 }
@@ -364,7 +360,6 @@ impl Reducer {
                 for utxo in genesis_utxos {
                     self.process_received(output.clone(), None, Some(utxo), false, 0)
                         .await
-                        .apply_policy(&error_policy)
                         .or_panic()?;
                 }
 

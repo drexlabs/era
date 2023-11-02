@@ -354,8 +354,6 @@ impl Reducer {
         rollback: bool,
         output: Arc<Mutex<OutputPort<CRDTCommand>>>,
     ) -> Result<(), gasket::framework::WorkerError> {
-        let policy = self.ctx.lock().await.error_policy.clone();
-
         match (block, genesis_utxos) {
             (Some(block), _) => {
                 let block_ctx = &block_ctx;
@@ -371,7 +369,6 @@ impl Reducer {
                                     rollback,
                                 )
                                 .await
-                                .apply_policy(&policy)
                                 .or_panic()?;
                             }
                         }
@@ -387,7 +384,6 @@ impl Reducer {
                                 rollback,
                             )
                             .await
-                            .apply_policy(&policy)
                             .or_panic()?;
                         }
                     }
@@ -403,7 +399,6 @@ impl Reducer {
 
                     self.tx_state(output.clone(), &address, &key, true)
                         .await
-                        .apply_policy(&policy)
                         .or_panic()?;
 
                     self.coin_state(
@@ -414,7 +409,6 @@ impl Reducer {
                         !rollback,
                     )
                     .await
-                    .apply_policy(&policy)
                     .or_panic()?;
                 }
 

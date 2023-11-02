@@ -53,7 +53,6 @@ pub struct Stage {
     pub genesis_config: Option<String>,
     pub intersect_config: crosscut::IntersectConfig,
     pub finalize_config: Option<crosscut::FinalizeConfig>,
-    pub policy_config: Option<crosscut::policies::RuntimePolicy>,
     pub blocks_config: Option<crosscut::historic::BlockConfig>,
     pub sources_config: Option<sources::Config>,
     pub enrich_config: Option<enrich::Config>,
@@ -77,7 +76,6 @@ impl gasket::framework::Worker<Stage> for Pipeline {
                     Some(finalize_config) => Some(finalize_config.into()),
                     None => None,
                 },
-                error_policy: stage.policy_config.clone().unwrap_or_default(),
                 block_buffer: stage.blocks_config.clone().unwrap_or_default().into(),
                 genesis_file: from_file(std::path::Path::new(
                     &stage.genesis_config.clone().unwrap_or(format!(
@@ -226,7 +224,6 @@ impl Pipeline {
         intersect_config: crosscut::IntersectConfig,
         genesis_config: Option<String>,
         finalize_config: Option<crosscut::FinalizeConfig>,
-        policy_config: Option<crosscut::policies::RuntimePolicy>,
         blocks_config: Option<crosscut::historic::BlockConfig>,
         sources_config: Option<sources::Config>,
         enrich_config: Option<enrich::Config>,
@@ -239,7 +236,6 @@ impl Pipeline {
             intersect_config,
             genesis_config,
             finalize_config,
-            policy_config,
             blocks_config,
             sources_config,
             storage_config,
@@ -281,6 +277,5 @@ pub struct Context {
     pub intersect: crosscut::IntersectConfig,
     pub finalize: Option<crosscut::FinalizeConfig>,
     pub block_buffer: crosscut::historic::BufferBlocks,
-    pub error_policy: crosscut::policies::RuntimePolicy,
     pub genesis_file: GenesisFile,
 }

@@ -44,16 +44,10 @@ impl Reducer {
     ) -> Result<(), gasket::framework::WorkerError> {
         match (block, block_ctx) {
             (Some(block), Some(block_ctx)) => {
-                let error_policy = self.ctx.lock().await.error_policy.clone();
-
                 for tx in block.txs().iter() {
                     if rollback {
                         for input in tx.consumes() {
-                            if let Some(txo) = block_ctx
-                                .find_utxo(&input.output_ref())
-                                .apply_policy(&error_policy)
-                                .or_panic()?
-                            {
+                            if let Ok(txo) = block_ctx.find_utxo(&input.output_ref()) {
                                 let mut asset_names: Vec<String> = vec![];
 
                                 for asset_list in txo.non_ada_assets() {

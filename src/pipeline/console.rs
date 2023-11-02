@@ -1057,17 +1057,14 @@ impl TuiConsole {
                                     //     self.enrich_skipped_empty.set_message(state);
                                     // }
                                     // (_, "enrich_removes", Reading::Count(x)) => {
-                                    //     self.enrich_removes.set_position(x);
-                                    //     self.enrich_removes.set_message(state);
+                                    //     snapshot.enrich_hit.set_num(x);
                                     // }
-                                    // (_, "enrich_matches", Reading::Count(x)) => {
-                                    //     self.enrich_matches.set_position(x);
-                                    //     self.enrich_matches.set_message(state);
-                                    // }
-                                    // (_, "enrich_mismatches", Reading::Count(x)) => {
-                                    //     self.enrich_mismatches.set_position(x);
-                                    //     self.enrich_mismatches.set_message(state);
-                                    // }
+                                    (_, "enrich_matches", Reading::Count(x)) => {
+                                        snapshot.enrich_hit.set_num(x);
+                                    }
+                                    (_, "enrich_mismatches", Reading::Count(x)) => {
+                                        snapshot.enrich_miss.set_num(x);
+                                    }
                                     // (_, "enrich_blocks", Reading::Count(x)) => {
                                     //     self.enrich_blocks.set_position(x);
                                     //     self.enrich_blocks.set_message(state);

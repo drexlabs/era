@@ -187,7 +187,7 @@ impl Worker {
         db: &sled::Db,
         block_number: u64,
         txs: &[MultiEraTx],
-    ) -> Result<(BlockContext, u64, u64), crate::Error> {
+    ) -> (BlockContext, u64, u64) {
         let mut ctx = BlockContext::default();
 
         let mut match_count: u64 = 0;
@@ -206,16 +206,19 @@ impl Worker {
             .map(|utxo_ref| fetch_referenced_utxo(db, utxo_ref))
             .collect();
 
-        for m in matches? {
-            if let Some((key, era, cbor)) = m {
-                ctx.import_ref_output(&key, era, cbor);
-                match_count += 1;
-            } else {
-                mismatch_count += 1;
+        for result in matches.unwrap() {
+            match result {
+                Some((key, era, cbor)) => {
+                    ctx.import_ref_output(&key, era, cbor);
+                    match_count += 1;
+                }
+                None => {
+                    mismatch_count += 1;
+                }
             }
         }
 
-        Ok((ctx, match_count, mismatch_count))
+        (ctx, match_count, mismatch_count)
     }
 
     fn get_removed(
@@ -375,8 +378,6 @@ impl gasket::framework::Worker<Stage> for Worker {
         unit: &RawBlockPayload,
         stage: &mut Stage,
     ) -> Result<(), WorkerError> {
-        let policy = stage.ctx.lock().await.error_policy.clone();
-
         match self.db_refs_all() {
             Ok(db_refs) => match db_refs {
                 Some((db, consumed_ring)) => match unit {
@@ -386,7 +387,6 @@ impl gasket::framework::Worker<Stage> for Worker {
                         for utxo in all {
                             self.insert_genesis_utxo(&db, &utxo, &stage.enrich_inserts)
                                 .map_err(crate::Error::storage)
-                                .apply_policy(&policy)
                                 .or_panic()?;
                         }
 
@@ -404,52 +404,38 @@ impl gasket::framework::Worker<Stage> for Worker {
                     model::RawBlockPayload::RollForward(cbor) => {
                         let block = MultiEraBlock::decode(&cbor)
                             .map_err(crate::Error::cbor)
-                            .apply_policy(&policy)
                             .or_panic()?;
-
-                        let block = block.unwrap();
 
                         let txs = block.txs();
 
-                        match self
-                            .par_fetch_referenced_utxos(db, block.number(), &txs)
-                            .apply_policy(&policy)
-                            .or_restart()?
-                        {
-                            Some((ctx, match_count, mismatch_count)) => {
-                                stage.enrich_matches.inc(match_count);
-                                stage.enrich_mismatches.inc(mismatch_count);
+                        let mut generated_ctx = None;
 
-                                let (_, removed_count) =
-                                    self.remove_consumed_utxos(db, consumed_ring, &txs).unwrap(); // not handling error, todo
+                        let (ctx, match_count, mismatch_count) =
+                            self.par_fetch_referenced_utxos(db, block.number(), &txs);
 
-                                stage.enrich_removes.inc(removed_count);
+                        stage.enrich_matches.inc(match_count);
+                        stage.enrich_mismatches.inc(mismatch_count);
 
-                                stage.enrich_blocks.inc(1);
+                        let (_, removed_count) =
+                            self.remove_consumed_utxos(db, consumed_ring, &txs).unwrap(); // not handling error, todo
 
-                                stage
-                                    .output
-                                    .send(model::EnrichedBlockPayload::roll_forward(
-                                        cbor.clone(),
-                                        ctx,
-                                    ))
-                                    .await
-                                    .map_err(|_| WorkerError::Send)
-                                    .or_panic()?;
+                        stage.enrich_removes.inc(removed_count);
 
-                                match self
-                                    .insert_produced_utxos(db, &txs, &stage.enrich_inserts)
-                                    .map_err(crate::Error::storage)
-                                    .apply_policy(&policy)
-                                    .or_panic()?
-                                {
-                                    Some(_) => Ok(()),
+                        stage.enrich_blocks.inc(1);
+                        generated_ctx = Some(ctx);
 
-                                    None => Err(WorkerError::Panic),
-                                }
-                            }
-                            None => Err(WorkerError::Panic),
-                        }
+                        self.insert_produced_utxos(db, &txs, &stage.enrich_inserts)
+                            .map_err(crate::Error::storage)
+                            .or_panic()?;
+
+                        stage
+                            .output
+                            .send(model::EnrichedBlockPayload::roll_forward(
+                                cbor.clone(),
+                                generated_ctx.unwrap_or_default(),
+                            ))
+                            .await
+                            .or_panic()
                     }
 
                     model::RawBlockPayload::RollBack(
@@ -471,8 +457,7 @@ impl gasket::framework::Worker<Stage> for Worker {
                                     db,
                                     last_known_block_number.clone(),
                                     &txs,
-                                )
-                                .or_panic()?;
+                                );
 
                             stage.enrich_matches.inc(match_count);
                             stage.enrich_mismatches.inc(mismatch_count);
@@ -480,7 +465,6 @@ impl gasket::framework::Worker<Stage> for Worker {
                             // Revert Anything to do with this block from consumed ring
                             self.remove_produced_utxos(db, &txs, &stage.enrich_removes)
                                 .map_err(crate::Error::storage)
-                                .apply_policy(&policy)
                                 .or_panic()?;
 
                             stage

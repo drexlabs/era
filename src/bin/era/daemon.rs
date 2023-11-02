@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use clap;
 use era::{
@@ -51,13 +51,20 @@ pub fn run(args: &Args) -> Result<(), era::Error> {
     let config = ConfigRoot::new(&args.config)
         .map_err(|err| era::Error::ConfigError(format!("{:?}", err)))?;
 
+    let default_policy = gasket::retries::Policy {
+        max_retries: 20,
+        backoff_unit: Duration::from_secs(1),
+        backoff_factor: 2,
+        max_backoff: Duration::from_secs(60),
+        dismissible: false,
+    };
+
     spawn_stage(
         pipeline::Pipeline::bootstrap(
             config.chain,
             config.intersect,
             config.genesis,
             config.finalize,
-            config.policy,
             config.blocks,
             Some(config.source),
             config.enrich,
@@ -65,7 +72,12 @@ pub fn run(args: &Args) -> Result<(), era::Error> {
             Some(config.storage),
             args.console.clone(),
         ),
-        Default::default(), // todo dont use default policy
+        gasket::runtime::Policy {
+            tick_timeout: None,
+            bootstrap_retry: default_policy.clone(),
+            work_retry: default_policy.clone(),
+            teardown_retry: default_policy.clone(),
+        },
     );
 
     Ok(())
