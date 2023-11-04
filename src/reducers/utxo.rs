@@ -368,7 +368,7 @@ impl Reducer {
                                 rollback,
                             )
                             .await
-                            .or_else(|| Ok(()));
+                            .or_else(|_| Err(()));
                         }
 
                         for (idx, produced) in tx.produces().iter() {
