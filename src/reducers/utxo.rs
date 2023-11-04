@@ -6,14 +6,14 @@ use blake2::Blake2bVar;
 use pallas::crypto::hash::Hash;
 use pallas::ledger::addresses::{Address, StakeAddress};
 use pallas::ledger::configs::byron::GenesisUtxo;
-use pallas::ledger::traverse::{MultiEraAsset, MultiEraBlock, OutputRef};
+use pallas::ledger::traverse::{MultiEraAsset, MultiEraBlock, MultiEraOutput, OutputRef};
 use serde::{Deserialize, Serialize};
 
 use gasket::framework::WorkerError;
 use gasket::messaging::tokio::OutputPort;
 use tokio::sync::Mutex;
 
-use crate::model::{BlockOrigination, CRDTCommand};
+use crate::model::{BlockContext, BlockOrigination, CRDTCommand};
 use crate::pipeline::Context;
 use crate::{model, prelude::*};
 
@@ -164,7 +164,7 @@ impl Reducer {
         output: Arc<Mutex<OutputPort<CRDTCommand>>>,
         address: &str,
         tx_str: &str,
-        utxo: BlockOrigination<'b>,
+        utxo: &'b MultiEraOutput<'b>,
         should_exist: bool,
     ) -> Result<(), Error> {
         match utxo.datum() {
@@ -226,7 +226,7 @@ impl Reducer {
                 output.clone(),
                 soa.as_str(),
                 &format!("{}#{}", input.hash(), input.index()),
-                utxo,
+                &utxo,
                 rollback,
             )
             .await?;
@@ -279,7 +279,7 @@ impl Reducer {
     async fn process_produced_txo<'b>(
         &mut self,
         tx_hash: &Hash<32>,
-        tx_output: &'b BlockOrigination<'b>,
+        tx_output: &'b MultiEraOutput<'b>,
         output_idx: usize,
         output: Arc<Mutex<OutputPort<CRDTCommand>>>,
         rollback: bool,
@@ -300,7 +300,7 @@ impl Reducer {
                 output.clone(),
                 &tx_address,
                 &format!("{}#{}", tx_hash, output_idx),
-                tx_output.clone(),
+                tx_output,
                 !rollback,
             )
             .await?;
@@ -356,29 +356,25 @@ impl Reducer {
     ) -> Result<(), gasket::framework::WorkerError> {
         match (block, genesis_utxos) {
             (Some(block), _) => {
-                let block_ctx = &block_ctx;
+                let block_ctx = &block_ctx.unwrap_or(BlockContext::default());
 
                 for tx in block.txs() {
                     if tx.is_valid() {
-                        if let Some(block_ctx) = block_ctx {
-                            for consumed in tx.consumes().iter().map(|i| i.output_ref()) {
-                                self.process_consumed_txo(
-                                    &block_ctx,
-                                    &consumed,
-                                    output.clone(),
-                                    rollback,
-                                )
-                                .await
-                                .or_panic()?;
-                            }
+                        for consumed in tx.consumes().iter().map(|i| i.output_ref()) {
+                            self.process_consumed_txo(
+                                &block_ctx,
+                                &consumed,
+                                output.clone(),
+                                rollback,
+                            )
+                            .await
+                            .or_panic()?;
                         }
 
-                        for (idx, _) in tx.produces().iter() {
+                        for (idx, produced) in tx.produces().iter() {
                             self.process_produced_txo(
                                 &tx.hash(),
-                                &BlockOrigination::Chain(
-                                    tx.produces().get(idx.clone()).as_ref().unwrap().1.clone(),
-                                ),
+                                produced,
                                 idx.clone(),
                                 output.clone(),
                                 rollback,
@@ -401,15 +397,9 @@ impl Reducer {
                         .await
                         .or_panic()?;
 
-                    self.coin_state(
-                        output.clone(),
-                        &address,
-                        &key,
-                        &utxo.2.to_string(),
-                        !rollback,
-                    )
-                    .await
-                    .or_panic()?;
+                    self.coin_state(output.clone(), &address, &key, &utxo.2.to_string(), false)
+                        .await
+                        .or_panic()?;
                 }
 
                 Ok(())

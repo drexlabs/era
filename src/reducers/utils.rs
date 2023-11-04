@@ -2,7 +2,10 @@ use bech32::{self, Error, ToBase32};
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 use hex::{self};
+use pallas::ledger::traverse::{block, MultiEraBlock, MultiEraOutput, MultiEraTx, OutputRef};
 use std::error::Error as Err;
+
+use crate::model::BlockContext;
 
 const ASSET_DATA: &str = "asset";
 

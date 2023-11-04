@@ -87,14 +87,14 @@ impl BlockContext {
         self.utxos.insert(key.to_string(), (era, cbor));
     }
 
-    pub fn find_utxo(&self, key: &OutputRef) -> Result<BlockOrigination, Error> {
+    pub fn find_utxo(&self, key: &OutputRef) -> Result<MultiEraOutput, Error> {
         let (era, cbor) = self
             .utxos
             .get(&key.to_string())
             .ok_or_else(|| Error::missing_utxo(key))?;
 
         match MultiEraOutput::decode(*era, cbor) {
-            Ok(on_chain_output) => Ok(BlockOrigination::Chain(on_chain_output)),
+            Ok(on_chain_output) => Ok(on_chain_output),
             Err(e) => Err(Error::missing_utxo(e)),
         }
     }
