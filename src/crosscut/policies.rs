@@ -16,7 +16,7 @@ impl Default for ErrorAction {
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-pub struct RuntimePolicy {
+pub struct BlockDataPolicy {
     pub missing_data: Option<ErrorAction>,
     pub cbor_errors: Option<ErrorAction>,
     pub ledger_errors: Option<ErrorAction>,
@@ -39,13 +39,13 @@ fn handle_error<T>(err: Error, action: &Option<ErrorAction>) -> Result<Option<T>
 pub trait AppliesPolicy {
     type Value;
 
-    fn apply_policy(self, policy: &RuntimePolicy) -> Result<Option<Self::Value>, crate::Error>;
+    fn apply_policy(self, policy: &BlockDataPolicy) -> Result<Option<Self::Value>, crate::Error>;
 }
 
 impl<T> AppliesPolicy for Result<T, crate::Error> {
     type Value = T;
 
-    fn apply_policy(self, policy: &RuntimePolicy) -> Result<Option<Self::Value>, crate::Error> {
+    fn apply_policy(self, policy: &BlockDataPolicy) -> Result<Option<Self::Value>, crate::Error> {
         match self {
             Ok(t) => Ok(Some(t)),
             Err(err) => {

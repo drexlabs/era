@@ -6,10 +6,9 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use gasket::{
-    messaging::tokio::{InputPort, OutputPort},
-    runtime::Tether,
+    messaging::{InputPort, OutputPort},
+    runtime::{Policy, Tether},
 };
-use tokio::sync::Mutex;
 
 use crate::{model, pipeline};
 
@@ -27,15 +26,11 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn bootstrapper(
-        self,
-        ctx: Arc<Mutex<pipeline::Context>>,
-        rollback_db_path: String,
-    ) -> Option<Bootstrapper> {
-        Some(match self {
+    pub fn bootstrapper(self, ctx: Arc<pipeline::Context>) -> Bootstrapper {
+        match self {
             Config::Skip(w) => Bootstrapper::Skip(w.bootstrapper()),
-            Config::Sled(w) => Bootstrapper::Sled(w.bootstrapper(ctx, rollback_db_path)),
-        })
+            Config::Sled(w) => Bootstrapper::Sled(w.bootstrapper(ctx)),
+        }
     }
 }
 
@@ -45,13 +40,6 @@ pub enum Bootstrapper {
 }
 
 impl Bootstrapper {
-    pub fn borrow_input_port(&mut self) -> &'_ mut InputPort<model::RawBlockPayload> {
-        match self {
-            Bootstrapper::Skip(s) => &mut s.input,
-            Bootstrapper::Sled(s) => &mut s.input,
-        }
-    }
-
     pub fn borrow_output_port(&mut self) -> &'_ mut OutputPort<model::EnrichedBlockPayload> {
         match self {
             Bootstrapper::Skip(s) => &mut s.output,
@@ -59,10 +47,17 @@ impl Bootstrapper {
         }
     }
 
-    pub fn spawn_stage(self, pipeline: &pipeline::Pipeline) -> Tether {
+    pub fn borrow_input_port(&mut self) -> &'_ mut InputPort<model::RawBlockPayload> {
         match self {
-            Bootstrapper::Skip(s) => gasket::runtime::spawn_stage(s, pipeline.policy.clone()),
-            Bootstrapper::Sled(s) => gasket::runtime::spawn_stage(s, pipeline.policy.clone()),
+            Bootstrapper::Skip(s) => &mut s.input,
+            Bootstrapper::Sled(s) => &mut s.input,
+        }
+    }
+
+    pub fn spawn_stage(self, policy: Policy) -> Tether {
+        match self {
+            Bootstrapper::Skip(s) => gasket::runtime::spawn_stage(s, policy),
+            Bootstrapper::Sled(s) => gasket::runtime::spawn_stage(s, policy),
         }
     }
 }

@@ -48,6 +48,9 @@ pub enum Error {
 
     #[error("{0}")]
     Custom(String),
+
+    #[error("{0}")]
+    Reducer(String),
 }
 
 impl Error {
@@ -93,6 +96,10 @@ impl Error {
 
     pub fn custom(error: Box<dyn std::error::Error>) -> Error {
         Error::Custom(format!("{}", error))
+    }
+
+    pub fn reducer(error: impl Display) -> Error {
+        Error::Reducer(format!("{}", error))
     }
 }
 

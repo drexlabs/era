@@ -1,22 +1,17 @@
-use std::sync::Arc;
-
-use gasket::framework::*;
-use gasket::messaging::tokio::InputPort;
+use gasket::{framework::*, messaging::InputPort};
 use serde::Deserialize;
-use tokio::sync::Mutex;
 
-use crate::{crosscut, model::CRDTCommand, pipeline::Context};
+use crate::{crosscut, model::CRDTCommand};
 
 #[derive(Deserialize, Clone)]
 pub struct Config {}
 
 impl Config {
-    pub fn bootstrapper(self, ctx: Arc<Mutex<Context>>) -> Stage {
+    pub fn bootstrapper(self) -> Stage {
         Stage {
             _config: self.clone(),
-            input: Default::default(),
-            ctx,
             ops_count: Default::default(),
+            input: Default::default(),
         }
     }
 }
@@ -36,8 +31,6 @@ pub struct Worker {}
 #[stage(name = "storage-skip", unit = "CRDTCommand", worker = "Worker")]
 pub struct Stage {
     _config: Config,
-    pub ctx: Arc<Mutex<Context>>,
-
     pub input: InputPort<CRDTCommand>,
 
     #[metric]

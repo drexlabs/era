@@ -1,0 +1,22 @@
+[Unit]
+Description=Era: Redis Block Index
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/redis-server /etc/redis/era-blocks.conf
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=redis-blocks
+Environment=RUST_LOG=WARN
+LimitNOFILE=1080
+Restart=on-failure
+RestartSec=1s
+WorkingDirectory=/era-redis-blocks
+User=root
+Group=root
+MemoryHigh=1G
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

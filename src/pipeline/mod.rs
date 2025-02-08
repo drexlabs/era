@@ -1,20 +1,17 @@
 pub mod console;
 
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
-use crate::{crosscut, enrich, reducers, sources, storage};
+use crate::{crosscut, model::ConfigRoot};
 
 use gasket::{
     framework::*,
     messaging::tokio::connect_ports,
-    retries,
-    runtime::{spawn_stage, Policy, StagePhase, Tether, TetherState},
+    runtime::{Policy, StagePhase, Tether, TetherState},
 };
-use pallas::ledger::{
-    configs::byron::{from_file, GenesisFile},
-    traverse::wellknown::GenesisValues,
-};
-use tokio::sync::Mutex;
+use pallas::ledger::{configs::byron::GenesisFile, traverse::wellknown::GenesisValues};
+
+static GASKET_CAP: usize = 100;
 
 pub enum StageTypes {
     Source,
@@ -49,116 +46,99 @@ impl std::convert::From<&str> for StageTypes {
 #[derive(Stage)]
 #[stage(name = "pipeline-bootstrapper", unit = "()", worker = "Pipeline")]
 pub struct Stage {
-    pub chain_config: Option<crosscut::ChainConfig>,
-    pub genesis_config: Option<String>,
-    pub intersect_config: crosscut::IntersectConfig,
-    pub finalize_config: Option<crosscut::FinalizeConfig>,
-    pub blocks_config: Option<crosscut::historic::BlockConfig>,
-    pub sources_config: Option<sources::Config>,
-    pub enrich_config: Option<enrich::Config>,
-    pub reducer_config: Vec<reducers::Config>,
-    pub storage_config: Option<storage::Config>,
-    pub args_console: Option<console::Mode>,
+    config: RefCell<ConfigRoot>,
+    args_console: Arc<console::Mode>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl gasket::framework::Worker<Stage> for Pipeline {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
-        console::initialize(stage.args_console.clone()).await;
+        let mut config = stage.config.borrow_mut();
 
-        console::refresh(&stage.args_console, None).await?;
+        console::initialize(stage.args_console.as_ref()).await;
+
+        console::refresh(stage.args_console.as_ref(), None).await?;
 
         let mut pipe = Self {
-            ctx: Arc::new(Mutex::new(Context {
-                chain: stage.chain_config.clone().unwrap_or_default().into(),
-                intersect: stage.intersect_config.clone().into(),
-                finalize: match stage.finalize_config.clone() {
-                    Some(finalize_config) => Some(finalize_config.into()),
-                    None => None,
-                },
-                block_buffer: stage.blocks_config.clone().unwrap_or_default().into(),
-                genesis_file: from_file(std::path::Path::new(
-                    &stage.genesis_config.clone().unwrap_or(format!(
-                        "/etc/era/{}-byron-genesis.json",
-                        match stage.chain_config.clone().unwrap_or_default() {
-                            crosscut::ChainConfig::Mainnet => "mainnet",
-                            crosscut::ChainConfig::Testnet => "testnet",
-                            crosscut::ChainConfig::PreProd => "preprod",
-                            crosscut::ChainConfig::Preview => "preview",
-                            _ => "",
-                        }
-                    )),
-                ))
-                .unwrap(),
-            })),
-            policy: Policy {
-                tick_timeout: None,
-                bootstrap_retry: retries::Policy::default(),
-                work_retry: retries::Policy::default(),
-                teardown_retry: retries::Policy::default(),
-            },
-
+            policy: config.take_gasket_policy(),
             tethers: Default::default(),
+            chain_config: Arc::new(config.chain.take().unwrap_or_default()),
+            ctx: config.take_some_to_make_context(),
         };
 
-        console::refresh(&stage.args_console, Some(&pipe)).await?;
+        console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
 
-        let enrich = stage.enrich_config.clone().unwrap();
-
-        let rollback_db_path = pipe
-            .ctx
-            .lock()
-            .await
-            .block_buffer
-            .config
-            .rollback_db_path
-            .clone();
+        let enrich = config.enrich.take().unwrap_or_default();
 
         log::warn!("getting latest intersection (this may take awhile)");
 
-        console::refresh(&stage.args_console, Some(&pipe)).await?;
+        console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
 
-        let mut enrich_stage = enrich
-            .bootstrapper(pipe.ctx.clone(), rollback_db_path)
+        let mut enrich_stage = enrich.bootstrapper(Arc::clone(&pipe.ctx));
+
+        console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
+
+        let mut storage_stage = config
+            .storage
+            .take()
+            .unwrap()
+            .bootstrapper(Arc::clone(&pipe.ctx))
             .unwrap();
 
-        console::refresh(&stage.args_console, Some(&pipe)).await?;
-
-        let enrich_input_port = enrich_stage.borrow_input_port();
-
-        let storage = stage.storage_config.as_ref().unwrap();
-        let mut storage_stage = storage.clone().bootstrapper(pipe.ctx.clone()).unwrap();
-
-        let source = stage.sources_config.as_ref().unwrap();
-        let mut source_stage = source
-            .clone()
-            .bootstrapper(pipe.ctx.clone(), storage_stage.build_cursor())
+        let mut source_stage = config
+            .source
+            .take()
+            .unwrap()
+            .bootstrapper(Arc::clone(&pipe.ctx), storage_stage.build_cursor())
             .unwrap();
 
-        let mut reducer = reducers::worker::bootstrap(
-            pipe.ctx.clone(),
-            stage.reducer_config.clone(),
-            storage_stage.borrow_input_port(),
+        let mut reducers_stage = config
+            .reducers
+            .take()
+            .unwrap()
+            .bootstrapper(Arc::clone(&pipe.ctx));
+
+        connect_ports(
+            source_stage.borrow_output_port(),
+            enrich_stage.borrow_input_port(),
+            GASKET_CAP,
         );
 
-        connect_ports(source_stage.borrow_output_port(), enrich_input_port, 100);
-        connect_ports(enrich_stage.borrow_output_port(), &mut reducer.input, 100);
+        connect_ports(
+            enrich_stage.borrow_output_port(),
+            reducers_stage.borrow_input_port(),
+            GASKET_CAP,
+        );
 
-        pipe.tethers.push(storage_stage.spawn_stage(&pipe));
-        pipe.tethers.push(spawn_stage(reducer, pipe.policy.clone()));
-        pipe.tethers.push(enrich_stage.spawn_stage(&pipe));
+        connect_ports(
+            reducers_stage.borrow_output_port(),
+            storage_stage.borrow_input_port(),
+            GASKET_CAP,
+        );
 
-        let mut startup_error = false;
+        pipe.tethers
+            .push(storage_stage.spawn_stage(pipe.policy.clone()));
+
+        pipe.tethers
+            .push(reducers_stage.spawn_stage(pipe.policy.clone()));
+
+        let mut tether_error = false;
+
+        log::warn!("pipeline: spawning tethers");
 
         loop {
+            console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
+
             let mut bootstrapping_consumers = false;
             for tether in &pipe.tethers {
+                console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
                 match tether.check_state() {
                     TetherState::Blocked(_) => {
                         bootstrapping_consumers = true;
                     }
                     TetherState::Dropped => {
-                        startup_error = true;
+                        log::warn!("pipeline: dropped tether {}", tether.name());
+                        tether_error = true;
                         break;
                     }
                     TetherState::Alive(s) => match s {
@@ -166,17 +146,22 @@ impl gasket::framework::Worker<Stage> for Pipeline {
                             bootstrapping_consumers = true;
                         }
                         StagePhase::Teardown => {
-                            startup_error = true;
+                            log::warn!("pipeline: tore down {}", tether.name());
+                            tether_error = true;
                         }
                         StagePhase::Ended => {
-                            startup_error = true;
+                            log::warn!("pipeline: ended {}", tether.name());
+                            tether_error = true;
                         }
-                        _ => {}
+                        StagePhase::Working => {
+                            bootstrapping_consumers = false;
+                        }
                     },
                 }
             }
 
-            if startup_error {
+            if tether_error {
+                log::warn!("pipeline: tether startup error");
                 return Err(WorkerError::Panic);
             }
 
@@ -185,7 +170,14 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             }
         }
 
-        pipe.tethers.push(source_stage.spawn_stage(&pipe));
+        pipe.tethers
+            .push(enrich_stage.spawn_stage(pipe.policy.clone()));
+
+        log::warn!("pipeline: reached data source tether");
+        pipe.tethers
+            .push(source_stage.spawn_stage(pipe.policy.clone()));
+
+        log::warn!("pipeline: all tethers are alive");
 
         return Ok(pipe);
     }
@@ -202,7 +194,8 @@ impl gasket::framework::Worker<Stage> for Pipeline {
 pub struct Pipeline {
     pub policy: Policy,
     pub tethers: Vec<Tether>,
-    pub ctx: Arc<Mutex<Context>>,
+    pub ctx: Arc<Context>,
+    pub chain_config: Arc<crosscut::ChainConfig>,
 }
 
 pub fn i64_to_string(mut i: i64) -> String {
@@ -219,28 +212,12 @@ pub fn i64_to_string(mut i: i64) -> String {
 }
 
 impl Pipeline {
-    pub fn bootstrap(
-        chain_config: Option<crosscut::ChainConfig>,
-        intersect_config: crosscut::IntersectConfig,
-        genesis_config: Option<String>,
-        finalize_config: Option<crosscut::FinalizeConfig>,
-        blocks_config: Option<crosscut::historic::BlockConfig>,
-        sources_config: Option<sources::Config>,
-        enrich_config: Option<enrich::Config>,
-        reducer_config: Vec<reducers::Config>,
-        storage_config: Option<storage::Config>,
-        args_console: Option<console::Mode>,
+    pub fn bootstrap_gasket_stage(
+        config: RefCell<ConfigRoot>,
+        args_console: Arc<console::Mode>,
     ) -> Stage {
         Stage {
-            chain_config,
-            intersect_config,
-            genesis_config,
-            finalize_config,
-            blocks_config,
-            sources_config,
-            storage_config,
-            enrich_config,
-            reducer_config,
+            config,
             args_console,
         }
     }
@@ -260,6 +237,7 @@ impl Pipeline {
             log::warn!("dismissing stage: {} with state {:?}", tether.name(), state);
             tether.dismiss_stage().expect("stage stops");
 
+            // Note: Below possibly isn't true anymore due to gasket-rs updates. need to investigate
             // Can't join the stage because there's a risk of deadlock, usually
             // because a stage gets stuck sending into a port which depends on a
             // different stage not yet dismissed. The solution is to either create a
@@ -274,7 +252,7 @@ impl Pipeline {
 
 pub struct Context {
     pub chain: GenesisValues,
-    pub intersect: crosscut::IntersectConfig,
+    pub intersect: Option<crosscut::IntersectConfig>,
     pub finalize: Option<crosscut::FinalizeConfig>,
     pub block_buffer: crosscut::historic::BufferBlocks,
     pub genesis_file: GenesisFile,

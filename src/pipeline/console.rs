@@ -1,20 +1,17 @@
 use chrono::Duration as ChronoDuration;
 use chrono::{DateTime, Utc};
-use crossterm::style::Colors;
 use gasket::{
     framework::WorkerError,
     metrics::Reading,
     runtime::{StagePhase, TetherState},
 };
-use lazy_static::{__Deref, lazy_static};
+use lazy_static::lazy_static;
 use log::Log;
 use ratatui::prelude::Layout;
-use ratatui::widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, Padding};
-use std::default;
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Padding};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 use crate::crosscut;
@@ -165,10 +162,8 @@ pub struct MetricsSnapshot {
     enrich_status: MeteredValue,
     reducer_status: MeteredValue,
     storage_status: MeteredValue,
-    enrich_save: MeteredValue,
     enrich_hit: MeteredValue,
     enrich_miss: MeteredValue,
-    storage_operations: MeteredValue,
 }
 
 impl Default for MetricsSnapshot {
@@ -184,10 +179,8 @@ impl Default for MetricsSnapshot {
             enrich_status: MeteredValue::Label(Default::default()),
             reducer_status: MeteredValue::Label(Default::default()),
             storage_status: MeteredValue::Label(Default::default()),
-            enrich_save: MeteredValue::Numerical(Default::default()),
             enrich_hit: MeteredValue::Numerical(Default::default()),
             enrich_miss: MeteredValue::Numerical(Default::default()),
-            storage_operations: MeteredValue::Numerical(Default::default()),
         }
     }
 }
@@ -218,23 +211,23 @@ pub struct BlockGraph {
 }
 
 impl LogBuffer {
-    pub fn new(capacity: usize) -> Self {
-        let base_time = Instant::now();
+    // pub fn new(capacity: usize) -> Self {
+    //     //let base_time = Instant::now();
 
-        Self {
-            vec: Arc::new(Mutex::new(vec![])),
-            capacity,
-        }
-    }
+    //     Self {
+    //         vec: Arc::new(Mutex::new(vec![])),
+    //         capacity,
+    //     }
+    // }
 
-    pub async fn push(&mut self, ele: (String, String)) {
-        let mut v = self.vec.lock().await;
-        if v.len() == self.capacity {
-            v.remove(0);
-        }
+    // pub async fn push(&mut self, ele: (String, String)) {
+    //     let mut v = self.vec.lock().await;
+    //     if v.len() == self.capacity {
+    //         v.remove(0);
+    //     }
 
-        v.push(ele.clone());
-    }
+    //     v.push(ele.clone());
+    // }
 
     pub async fn all(&self) -> Vec<(String, String)> {
         self.vec.lock().await.clone()
@@ -244,7 +237,7 @@ impl LogBuffer {
 impl BlockGraph {
     pub fn new(capacity: usize) -> Self {
         let base_time = Instant::now();
-        let mut vec: Vec<MetricsSnapshot> = Vec::default();
+        let vec: Vec<MetricsSnapshot> = Vec::default();
 
         Self {
             vec,
@@ -274,7 +267,7 @@ impl BlockGraph {
         for snapshot in self.vec.clone() {
             let current = snapshot.timestamp;
 
-            if current < min || min == Default::default() {
+            if current < min || min == Duration::default() {
                 min = current;
             }
 
@@ -440,8 +433,8 @@ impl TuiConsole {
         }
     }
 
-    async fn draw(&mut self, ctx: Option<Arc<Mutex<Context>>>, snapshot: &MetricsSnapshot) {
-        let current_era = snapshot.chain_era.get_string();
+    async fn draw(&mut self, ctx: Option<Arc<Context>>, snapshot: &MetricsSnapshot) {
+        //let current_era = snapshot.chain_era.get_string();
 
         let log_buffer_partial = LOG_BUFFER.all().await;
         let log_buffer_partial = log_buffer_partial.iter().rev();
@@ -462,510 +455,514 @@ impl TuiConsole {
             None => {}
         }
 
-        self.terminal.draw(|frame| {
-            let layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(vec![
-                    Constraint::Length(10),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(5),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(2),
-                ])
-                .split(frame.size());
+        self.terminal
+            .draw(|frame| {
+                let layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(vec![
+                        Constraint::Length(10),
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(5),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(2),
+                    ])
+                    .split(frame.size());
 
-            let mut log_buffer_string = String::default();
-            for entry in log_buffer_partial.rev().take(layout[1].height as usize - 2) {
-                log_buffer_string += &format!("{} {}\n", entry.0, entry.1);
-            }
+                let mut log_buffer_string = String::default();
+                for entry in log_buffer_partial.rev().take(layout[1].height as usize - 2) {
+                    log_buffer_string += &format!("{} {}\n", entry.0, entry.1);
+                }
 
-            let top_status_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![Constraint::Length(26), Constraint::Min(60)])
-                .split(layout[0]);
+                let top_status_layout = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(vec![Constraint::Length(26), Constraint::Min(60)])
+                    .split(layout[0]);
 
-            let progress_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![
-                    Constraint::Length(15),
-                    Constraint::Min(50),
-                    Constraint::Length(15),
-                ])
-                .split(layout[6]);
+                let progress_layout = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(vec![
+                        Constraint::Length(15),
+                        Constraint::Min(50),
+                        Constraint::Length(15),
+                    ])
+                    .split(layout[6]);
 
-            let mixed_chart_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![
-                    Constraint::Max(7),
-                    Constraint::Min(10),
-                    Constraint::Max(7),
-                ])
-                .split(layout[4]);
+                let mixed_chart_layout = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(vec![
+                        Constraint::Max(7),
+                        Constraint::Min(10),
+                        Constraint::Max(7),
+                    ])
+                    .split(layout[4]);
 
-            let chart_blocks_axis = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(vec![
-                    Constraint::Percentage(48),
-                    Constraint::Min(1),
-                    Constraint::Max(1),
-                ])
-                .split(mixed_chart_layout[0]);
+                let chart_blocks_axis = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(vec![
+                        Constraint::Percentage(48),
+                        Constraint::Min(1),
+                        Constraint::Max(1),
+                    ])
+                    .split(mixed_chart_layout[0]);
 
-            let chart_tx_axis = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(vec![
-                    Constraint::Percentage(48),
-                    Constraint::Min(1),
-                    Constraint::Max(1),
-                ])
-                .split(mixed_chart_layout[2]);
+                let chart_tx_axis = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(vec![
+                        Constraint::Percentage(48),
+                        Constraint::Min(1),
+                        Constraint::Max(1),
+                    ])
+                    .split(mixed_chart_layout[2]);
 
-            let progress = ratatui::widgets::Gauge::default()
-                .block(
-                    ratatui::widgets::Block::default()
-                        .borders(Borders::NONE)
-                        .style(Style::default().bg(Color::DarkGray))
-                        .padding(Padding::new(0, 0, 0, 0)),
-                )
-                .gauge_style(Style::new().blue())
-                .percent(
-                    match snapshot.chain_bar_depth.get_num() > 0
-                        && snapshot.chain_bar_progress.get_num() > 0
-                    {
-                        true => (snapshot.chain_bar_progress.get_num() as f64
-                            / snapshot.chain_bar_depth.get_num() as f64
-                            * 100.0)
-                            .round() as u16,
-                        false => 0,
-                    },
+                let progress = ratatui::widgets::Gauge::default()
+                    .block(
+                        ratatui::widgets::Block::default()
+                            .borders(Borders::NONE)
+                            .style(Style::default().bg(Color::DarkGray))
+                            .padding(Padding::new(0, 0, 0, 0)),
+                    )
+                    .gauge_style(Style::new().blue())
+                    .percent(
+                        match snapshot.chain_bar_depth.get_num() > 0
+                            && snapshot.chain_bar_progress.get_num() > 0
+                        {
+                            true => (snapshot.chain_bar_progress.get_num() as f64
+                                / snapshot.chain_bar_depth.get_num() as f64
+                                * 100.0)
+                                .round() as u16,
+                            false => 0,
+                        },
+                    );
+
+                //let bottom_pane = ratatui::widgets::Block::default().title("Hi");
+
+                //frame.render_widget(bottom_pane, layout[0]);
+
+                frame.render_widget(
+                    Paragraph::new(log_buffer_string)
+                        .block(
+                            ratatui::widgets::Block::new()
+                                .padding(Padding::new(
+                                    3, // left
+                                    1, // right
+                                    1, // top
+                                    1, // bottom
+                                ))
+                                .fg(Color::Blue),
+                        )
+                        .alignment(Alignment::Left),
+                    layout[1],
                 );
 
-            //let bottom_pane = ratatui::widgets::Block::default().title("Hi");
+                frame.render_widget(
+                    Paragraph::new(snapshot.chain_era.get_string())
+                        .block(ratatui::widgets::Block::new().padding(Padding::new(
+                            0, // left
+                            1, // right
+                            0, // top
+                            0, // bottom
+                        )))
+                        .alignment(Alignment::Right),
+                    progress_layout[0],
+                );
 
-            //frame.render_widget(bottom_pane, layout[0]);
+                let progress_footer_layout = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(vec![
+                        Constraint::Length(progress_layout[2].width - 1),
+                        Constraint::Max(20),
+                        Constraint::Min(10),
+                        Constraint::Length(progress_layout[2].width - 1),
+                    ])
+                    .split(layout[7]);
 
-            frame.render_widget(
-                Paragraph::new(log_buffer_string)
-                    .block(
-                        ratatui::widgets::Block::new()
-                            .padding(Padding::new(
-                                3, // left
-                                1, // right
-                                1, // top
-                                1, // bottom
+                frame.render_widget(
+                    Paragraph::new(include_str!("./../../assets/boot.txt"))
+                        .block(ratatui::widgets::Block::new().padding(Padding::new(
+                            3, // left
+                            0, // right
+                            2, // top
+                            0, // bottom
+                        )))
+                        .alignment(Alignment::Left),
+                    top_status_layout[0],
+                );
+
+                // frame.render_widget(
+                //     Paragraph::new("hi")
+                //         .block(ratatui::widgets::Block::new())
+                //         .alignment(Alignment::Left),
+                //     layout[1],
+                // );
+
+                match has_ctx {
+                    true => {
+                        let status_sublayout = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints(vec![
+                                Constraint::Length(2),
+                                Constraint::Length(1),
+                                Constraint::Min(1),
+                            ])
+                            .split(top_status_layout[1]);
+
+                        let sources_status = snapshot.sources_status.get_string();
+                        let enrich_status = snapshot.enrich_status.get_string();
+                        let reducer_status = snapshot.reducer_status.get_string();
+                        let storage_status = snapshot.storage_status.get_string();
+
+                        frame.render_widget(
+                            Paragraph::new("Gasket Workers")
+                                .block(ratatui::widgets::Block::new().padding(Padding::new(
+                                    0, // left
+                                    0, // right
+                                    0, // top
+                                    0, // bottom
+                                )))
+                                .bold()
+                                .alignment(Alignment::Left),
+                            status_sublayout[1],
+                        );
+
+                        frame.render_widget(
+                            Paragraph::new(format!(
+                                "{} Source\n{} Enrich ({} hits / {} misses)\n{} Reduce\n{} Storage",
+                                if sources_status.is_empty() {
+                                    "⧗".to_string()
+                                } else {
+                                    sources_status
+                                },
+                                if enrich_status.is_empty() {
+                                    "⚠".to_string()
+                                } else {
+                                    enrich_status
+                                },
+                                snapshot.enrich_hit.get_num(),
+                                snapshot.enrich_miss.get_num(),
+                                if reducer_status.is_empty() {
+                                    "⧗".to_string()
+                                } else {
+                                    reducer_status
+                                },
+                                if storage_status.is_empty() {
+                                    "⧗".to_string()
+                                } else {
+                                    storage_status
+                                }
                             ))
-                            .fg(Color::Blue),
-                    )
-                    .alignment(Alignment::Left),
-                layout[1],
-            );
-
-            frame.render_widget(
-                Paragraph::new(snapshot.chain_era.get_string())
-                    .block(ratatui::widgets::Block::new().padding(Padding::new(
-                        0, // left
-                        1, // right
-                        0, // top
-                        0, // bottom
-                    )))
-                    .alignment(Alignment::Right),
-                progress_layout[0],
-            );
-
-            let progress_footer_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![
-                    Constraint::Length(progress_layout[2].width - 1),
-                    Constraint::Max(20),
-                    Constraint::Min(10),
-                    Constraint::Length(progress_layout[2].width - 1),
-                ])
-                .split(layout[7]);
-
-            frame.render_widget(
-                Paragraph::new(include_str!("./../../assets/boot.txt"))
-                    .block(ratatui::widgets::Block::new().padding(Padding::new(
-                        3, // left
-                        0, // right
-                        2, // top
-                        0, // bottom
-                    )))
-                    .alignment(Alignment::Left),
-                top_status_layout[0],
-            );
-
-            // frame.render_widget(
-            //     Paragraph::new("hi")
-            //         .block(ratatui::widgets::Block::new())
-            //         .alignment(Alignment::Left),
-            //     layout[1],
-            // );
-
-            match has_ctx {
-                true => {
-                    let status_sublayout = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints(vec![
-                            Constraint::Length(2),
-                            Constraint::Length(1),
-                            Constraint::Min(1),
-                        ])
-                        .split(top_status_layout[1]);
-
-                    let sources_status = snapshot.sources_status.get_string();
-                    let enrich_status = snapshot.enrich_status.get_string();
-                    let reducer_status = snapshot.reducer_status.get_string();
-                    let storage_status = snapshot.storage_status.get_string();
-
-                    frame.render_widget(
-                        Paragraph::new("Gasket Workers")
                             .block(ratatui::widgets::Block::new().padding(Padding::new(
                                 0, // left
                                 0, // right
                                 0, // top
                                 0, // bottom
                             )))
-                            .bold()
                             .alignment(Alignment::Left),
-                        status_sublayout[1],
-                    );
+                            status_sublayout[2],
+                        );
+                    }
+                    false => {
+                        frame.render_widget(
+                            Paragraph::new("Opening historic block buffer...")
+                                .block(ratatui::widgets::Block::new().padding(Padding::new(
+                                    0, // left
+                                    0, // right
+                                    2, // top
+                                    0, // bottom
+                                )))
+                                .alignment(Alignment::Left),
+                            top_status_layout[1],
+                        );
+                    }
+                }
 
-                    frame.render_widget(
-                        Paragraph::new(format!(
-                            "{} Source\n{} Enrich ({} hits / {} misses)\n{} Reduce\n{} Storage",
-                            if sources_status.is_empty() {
-                                "⧗".to_string()
-                            } else {
-                                sources_status
-                            },
-                            if enrich_status.is_empty() {
-                                "⚠".to_string()
-                            } else {
-                                enrich_status
-                            },
-                            snapshot.enrich_hit.get_num(),
-                            snapshot.enrich_miss.get_num(),
-                            if reducer_status.is_empty() {
-                                "⧗".to_string()
-                            } else {
-                                reducer_status
-                            },
-                            if storage_status.is_empty() {
-                                "⧗".to_string()
-                            } else {
-                                storage_status
-                            }
-                        ))
-                        .block(ratatui::widgets::Block::new().padding(Padding::new(
-                            0, // left
+                // frame.render_widget(
+                //     Paragraph::new(snapshot.chain_bar_progress.get_str())
+                //         .block(Block::new().padding(Padding::new(
+                //             0, // left
+                //             0, // right
+                //             0, // top
+                //             0, // bottom
+                //         )))
+                //         .alignment(Alignment::Left),
+                //     progress_footer_layout[0],
+                // );
+
+                frame.render_widget(progress, progress_layout[1]);
+
+                frame.render_widget(
+                    Paragraph::new(snapshot.chain_bar_depth.get_num().to_string().as_str())
+                        .block(Block::new().padding(Padding::new(
+                            1, // left
                             0, // right
                             0, // top
                             0, // bottom
                         )))
                         .alignment(Alignment::Left),
-                        status_sublayout[2],
-                    );
-                }
-                false => {
-                    frame.render_widget(
-                        Paragraph::new("Opening historic block buffer...")
-                            .block(ratatui::widgets::Block::new().padding(Padding::new(
-                                0, // left
-                                0, // right
-                                2, // top
-                                0, // bottom
-                            )))
-                            .alignment(Alignment::Left),
-                        top_status_layout[1],
-                    );
-                }
-            }
+                    progress_layout[2],
+                );
 
-            // frame.render_widget(
-            //     Paragraph::new(snapshot.chain_bar_progress.get_str())
-            //         .block(Block::new().padding(Padding::new(
-            //             0, // left
-            //             0, // right
-            //             0, // top
-            //             0, // bottom
-            //         )))
-            //         .alignment(Alignment::Left),
-            //     progress_footer_layout[0],
-            // );
+                match date_string {
+                    Some(date_string) => {
+                        frame.render_widget(
+                            Paragraph::new(date_string)
+                                .block(Block::new().padding(Padding::new(
+                                    1, // left
+                                    0, // right
+                                    0, // top
+                                    0, // bottom
+                                )))
+                                .alignment(Alignment::Left),
+                            progress_footer_layout[1],
+                        );
+                    }
 
-            frame.render_widget(progress, progress_layout[1]);
-
-            frame.render_widget(
-                Paragraph::new(snapshot.chain_bar_depth.get_num().to_string().as_str())
-                    .block(Block::new().padding(Padding::new(
-                        1, // left
-                        0, // right
-                        0, // top
-                        0, // bottom
-                    )))
-                    .alignment(Alignment::Left),
-                progress_layout[2],
-            );
-
-            match date_string {
-                Some(date_string) => {
-                    frame.render_widget(
-                        Paragraph::new(date_string)
-                            .block(Block::new().padding(Padding::new(
-                                1, // left
-                                0, // right
-                                0, // top
-                                0, // bottom
-                            )))
-                            .alignment(Alignment::Left),
-                        progress_footer_layout[1],
-                    );
+                    None => {}
                 }
 
-                None => {}
-            }
+                // frame.render_widget(
+                //     Paragraph::new(format!(
+                //         "{:?}\n{:?}\n{:?}",
+                //         self.metrics_buffer.window_for_snapshot_prop("transactions"),
+                //         self.metrics_buffer
+                //             .window_for_snapshot_prop("blocks_processed"),
+                //         self.metrics_buffer.timestamp_window(),
+                //     )),
+                //     layout[1],
+                // );
 
-            // frame.render_widget(
-            //     Paragraph::new(format!(
-            //         "{:?}\n{:?}\n{:?}",
-            //         self.metrics_buffer.window_for_snapshot_prop("transactions"),
-            //         self.metrics_buffer
-            //             .window_for_snapshot_prop("blocks_processed"),
-            //         self.metrics_buffer.timestamp_window(),
-            //     )),
-            //     layout[1],
-            // );
+                let chain_bar_progress_metrics = self
+                    .metrics_buffer
+                    .rates_for_snapshot_prop("blocks_processed");
 
-            let chain_bar_progress_metrics = self
-                .metrics_buffer
-                .rates_for_snapshot_prop("blocks_processed");
+                let time_remaining = match snapshot.chain_bar_depth.get_num() > 0
+                    && snapshot.chain_bar_progress.get_num() > 0
+                {
+                    true => remaining_time(
+                        chain_bar_progress_metrics.last().unwrap_or(&(0.0, 0.0)).1, // todo make 0 and handle
+                        snapshot.chain_bar_depth.get_num() as i64,
+                        snapshot.chain_bar_progress.get_num() as i64,
+                    ),
+                    false => 0.0.to_string(),
+                };
 
-            let time_remaining = match snapshot.chain_bar_depth.get_num() > 0
-                && snapshot.chain_bar_progress.get_num() > 0
-            {
-                true => remaining_time(
-                    chain_bar_progress_metrics.last().unwrap_or(&(0.0, 0.0)).1, // todo make 0 and handle
-                    snapshot.chain_bar_depth.get_num() as i64,
-                    snapshot.chain_bar_progress.get_num() as i64,
-                ),
-                false => 0.0.to_string(),
-            };
+                frame.render_widget(
+                    Paragraph::new(format!("{} remaining", time_remaining))
+                        .block(Block::new().padding(Padding::new(
+                            0, // left
+                            1, // right
+                            0, // top
+                            0, // bottom
+                        )))
+                        .alignment(Alignment::Right),
+                    progress_footer_layout[2],
+                );
 
-            frame.render_widget(
-                Paragraph::new(format!("{} remaining", time_remaining))
-                    .block(Block::new().padding(Padding::new(
-                        0, // left
-                        1, // right
-                        0, // top
-                        0, // bottom
-                    )))
-                    .alignment(Alignment::Right),
-                progress_footer_layout[2],
-            );
+                let chain_bar_window = self
+                    .metrics_buffer
+                    .window_for_snapshot_prop("blocks_processed");
 
-            let chain_bar_window = self
-                .metrics_buffer
-                .window_for_snapshot_prop("blocks_processed");
+                let time_window = self.metrics_buffer.timestamp_window();
 
-            let time_window = self.metrics_buffer.timestamp_window();
+                let transaction_metrics =
+                    self.metrics_buffer.rates_for_snapshot_prop("transactions");
+                let transaction_window =
+                    self.metrics_buffer.window_for_snapshot_prop("transactions");
 
-            let transaction_metrics = self.metrics_buffer.rates_for_snapshot_prop("transactions");
-            let transaction_window = self.metrics_buffer.window_for_snapshot_prop("transactions");
+                let dataset_blocks = vec![Dataset::default()
+                    .name("")
+                    .marker(symbols::Marker::Braille)
+                    .style(Style::default().fg(Color::Cyan))
+                    .graph_type(GraphType::Line)
+                    .data(&chain_bar_progress_metrics)];
 
-            let dataset_blocks = vec![Dataset::default()
-                .name("")
-                .marker(symbols::Marker::Braille)
-                .style(Style::default().fg(Color::Cyan))
-                .graph_type(GraphType::Line)
-                .data(&chain_bar_progress_metrics)];
+                let dataset_txs = vec![Dataset::default()
+                    .name("")
+                    .marker(symbols::Marker::Braille)
+                    .style(Style::default().fg(Color::Green))
+                    .graph_type(GraphType::Line)
+                    .data(&transaction_metrics)];
 
-            let dataset_txs = vec![Dataset::default()
-                .name("")
-                .marker(symbols::Marker::Braille)
-                .style(Style::default().fg(Color::Green))
-                .graph_type(GraphType::Line)
-                .data(&transaction_metrics)];
+                // let y_max = chain_bar_window.1.max(transaction_window.1);
+                // let y_min = chain_bar_window.1.min(transaction_window.1);
+                // let y_avg = (y_min + y_max) / 2.0;
 
-            // let y_max = chain_bar_window.1.max(transaction_window.1);
-            // let y_min = chain_bar_window.1.min(transaction_window.1);
-            // let y_avg = (y_min + y_max) / 2.0;
+                // let y_max_s = y_max.round().to_string();
+                // let y_avg_s = y_avg.round().to_string();
+                // let y_min_s = y_min.round().to_string();
 
-            // let y_max_s = y_max.round().to_string();
-            // let y_avg_s = y_avg.round().to_string();
-            // let y_min_s = y_min.round().to_string();
+                let chain_bar_min_s = chain_bar_window.0.round().to_string();
+                let chain_bar_max_s = chain_bar_window.1.round().to_string();
+                let chain_bar_avg = (chain_bar_window.0.round() + chain_bar_window.1.round()) / 2.0;
+                let chain_bar_avg_s = chain_bar_avg.round().to_string();
 
-            let chain_bar_min_s = chain_bar_window.0.round().to_string();
-            let chain_bar_max_s = chain_bar_window.1.round().to_string();
-            let chain_bar_avg = (chain_bar_window.0.round() + chain_bar_window.1.round()) / 2.0;
-            let chain_bar_avg_s = chain_bar_avg.round().to_string();
+                let tx_min_s = transaction_window.0.round().to_string();
+                let tx_max_s = transaction_window.1.round().to_string();
+                let tx_avg = (transaction_window.0.round() + transaction_window.1.round()) / 2.0;
+                let tx_avg_s = tx_avg.round().to_string();
 
-            let tx_min_s = transaction_window.0.round().to_string();
-            let tx_max_s = transaction_window.1.round().to_string();
-            let tx_avg = (transaction_window.0.round() + transaction_window.1.round()) / 2.0;
-            let tx_avg_s = tx_avg.round().to_string();
+                frame.render_widget(
+                    Paragraph::new(format!("{}┈", chain_bar_max_s))
+                        .block(Block::default().style(Style::default().fg(Color::Blue)))
+                        .alignment(Alignment::Right),
+                    chart_blocks_axis[0],
+                );
+                frame.render_widget(
+                    Paragraph::new(format!("{}┈", chain_bar_avg_s))
+                        .block(Block::default().style(Style::default().fg(Color::Blue)))
+                        .alignment(Alignment::Right),
+                    chart_blocks_axis[1],
+                );
+                frame.render_widget(
+                    Paragraph::new(format!("{}┈", chain_bar_min_s))
+                        .block(Block::default().style(Style::default().fg(Color::Blue)))
+                        .alignment(Alignment::Right),
+                    chart_blocks_axis[2],
+                );
 
-            frame.render_widget(
-                Paragraph::new(format!("{}┈", chain_bar_max_s))
-                    .block(Block::default().style(Style::default().fg(Color::Blue)))
-                    .alignment(Alignment::Right),
-                chart_blocks_axis[0],
-            );
-            frame.render_widget(
-                Paragraph::new(format!("{}┈", chain_bar_avg_s))
-                    .block(Block::default().style(Style::default().fg(Color::Blue)))
-                    .alignment(Alignment::Right),
-                chart_blocks_axis[1],
-            );
-            frame.render_widget(
-                Paragraph::new(format!("{}┈", chain_bar_min_s))
-                    .block(Block::default().style(Style::default().fg(Color::Blue)))
-                    .alignment(Alignment::Right),
-                chart_blocks_axis[2],
-            );
+                frame.render_widget(
+                    Paragraph::new(format!("┈{}", tx_max_s))
+                        .block(Block::default().style(Style::default().fg(Color::Green)))
+                        .alignment(Alignment::Left),
+                    chart_tx_axis[0],
+                );
+                frame.render_widget(
+                    Paragraph::new(format!("┈{}", tx_avg_s))
+                        .block(Block::default().style(Style::default().fg(Color::Green)))
+                        .alignment(Alignment::Left),
+                    chart_tx_axis[1],
+                );
+                frame.render_widget(
+                    Paragraph::new(format!("┈{}", tx_min_s))
+                        .block(Block::default().style(Style::default().fg(Color::Green)))
+                        .alignment(Alignment::Left),
+                    chart_tx_axis[2],
+                );
 
-            frame.render_widget(
-                Paragraph::new(format!("┈{}", tx_max_s))
-                    .block(Block::default().style(Style::default().fg(Color::Green)))
-                    .alignment(Alignment::Left),
-                chart_tx_axis[0],
-            );
-            frame.render_widget(
-                Paragraph::new(format!("┈{}", tx_avg_s))
-                    .block(Block::default().style(Style::default().fg(Color::Green)))
-                    .alignment(Alignment::Left),
-                chart_tx_axis[1],
-            );
-            frame.render_widget(
-                Paragraph::new(format!("┈{}", tx_min_s))
-                    .block(Block::default().style(Style::default().fg(Color::Green)))
-                    .alignment(Alignment::Left),
-                chart_tx_axis[2],
-            );
+                let chart_legend_struts = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(vec![
+                        Constraint::Length(mixed_chart_layout[0].width + 1),
+                        Constraint::Min(10),
+                        Constraint::Length(mixed_chart_layout[2].width + 1),
+                    ])
+                    .split(layout[3]);
 
-            let chart_legend_struts = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![
-                    Constraint::Length(mixed_chart_layout[0].width + 1),
-                    Constraint::Min(10),
-                    Constraint::Length(mixed_chart_layout[2].width + 1),
-                ])
-                .split(layout[3]);
+                let chart_legend_labels = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(vec![
+                        Constraint::Length(mixed_chart_layout[0].width + 8),
+                        Constraint::Min(10),
+                        Constraint::Length(mixed_chart_layout[2].width + 14),
+                    ])
+                    .split(layout[2]);
 
-            let chart_legend_labels = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![
-                    Constraint::Length(mixed_chart_layout[0].width + 8),
-                    Constraint::Min(10),
-                    Constraint::Length(mixed_chart_layout[2].width + 14),
-                ])
-                .split(layout[2]);
+                frame.render_widget(
+                    Paragraph::new("")
+                        .block(
+                            ratatui::widgets::Block::new()
+                                .padding(Padding::new(
+                                    0, // left
+                                    0, // right
+                                    0, // top
+                                    0, // bottom
+                                ))
+                                .borders(Borders::RIGHT)
+                                .border_style(Style::default().fg(Color::Blue)),
+                        )
+                        .alignment(Alignment::Right),
+                    chart_legend_struts[0],
+                );
 
-            frame.render_widget(
-                Paragraph::new("")
+                frame.render_widget(
+                    Paragraph::new("")
+                        .block(
+                            ratatui::widgets::Block::new()
+                                .padding(Padding::new(
+                                    0, // left
+                                    0, // right
+                                    0, // top
+                                    0, // bottom
+                                ))
+                                .borders(Borders::LEFT)
+                                .border_style(Style::default().fg(Color::Green)),
+                        )
+                        .alignment(Alignment::Right),
+                    chart_legend_struts[2],
+                );
+
+                frame.render_widget(
+                    Paragraph::new("▄ Blocks")
+                        .block(
+                            ratatui::widgets::Block::new()
+                                .padding(Padding::new(
+                                    0, // left
+                                    0, // right
+                                    0, // top
+                                    0, // bottom
+                                ))
+                                .fg(Color::Blue),
+                        )
+                        .alignment(Alignment::Right),
+                    chart_legend_labels[0],
+                );
+
+                frame.render_widget(
+                    Paragraph::new("Transactions ▄")
+                        .block(
+                            ratatui::widgets::Block::new()
+                                .padding(Padding::new(
+                                    0, // left
+                                    0, // right
+                                    0, // top
+                                    0, // bottom
+                                ))
+                                .fg(Color::Green),
+                        )
+                        .alignment(Alignment::Left),
+                    chart_legend_labels[2],
+                );
+
+                let chart = Chart::new(dataset_blocks)
                     .block(
-                        ratatui::widgets::Block::new()
+                        Block::new()
                             .padding(Padding::new(
-                                0, // left
+                                1, // left
                                 0, // right
                                 0, // top
                                 0, // bottom
                             ))
                             .borders(Borders::RIGHT)
-                            .border_style(Style::default().fg(Color::Blue)),
+                            .border_style(Style::default().fg(Color::Green)),
                     )
-                    .alignment(Alignment::Right),
-                chart_legend_struts[0],
-            );
+                    .y_axis(Axis::default().bounds([chain_bar_window.0, chain_bar_window.1]))
+                    .x_axis(Axis::default().bounds([time_window.0, time_window.1]));
 
-            frame.render_widget(
-                Paragraph::new("")
+                frame.render_widget(chart, mixed_chart_layout[1]);
+
+                let chart2 = Chart::new(dataset_txs)
                     .block(
                         ratatui::widgets::Block::new()
                             .padding(Padding::new(
                                 0, // left
-                                0, // right
+                                1, // right
                                 0, // top
                                 0, // bottom
                             ))
                             .borders(Borders::LEFT)
-                            .border_style(Style::default().fg(Color::Green)),
+                            .border_style(Style::default().fg(Color::Blue)),
                     )
-                    .alignment(Alignment::Right),
-                chart_legend_struts[2],
-            );
+                    .y_axis(Axis::default().bounds([transaction_window.0, transaction_window.1]))
+                    .x_axis(Axis::default().bounds([time_window.0, time_window.1]));
 
-            frame.render_widget(
-                Paragraph::new("▄ Blocks")
-                    .block(
-                        ratatui::widgets::Block::new()
-                            .padding(Padding::new(
-                                0, // left
-                                0, // right
-                                0, // top
-                                0, // bottom
-                            ))
-                            .fg(Color::Blue),
-                    )
-                    .alignment(Alignment::Right),
-                chart_legend_labels[0],
-            );
+                frame.render_widget(chart2, mixed_chart_layout[1]);
 
-            frame.render_widget(
-                Paragraph::new("Transactions ▄")
-                    .block(
-                        ratatui::widgets::Block::new()
-                            .padding(Padding::new(
-                                0, // left
-                                0, // right
-                                0, // top
-                                0, // bottom
-                            ))
-                            .fg(Color::Green),
-                    )
-                    .alignment(Alignment::Left),
-                chart_legend_labels[2],
-            );
-
-            let chart = Chart::new(dataset_blocks)
-                .block(
-                    Block::new()
-                        .padding(Padding::new(
-                            1, // left
-                            0, // right
-                            0, // top
-                            0, // bottom
-                        ))
-                        .borders(Borders::RIGHT)
-                        .border_style(Style::default().fg(Color::Green)),
-                )
-                .y_axis(Axis::default().bounds([chain_bar_window.0, chain_bar_window.1]))
-                .x_axis(Axis::default().bounds([time_window.0, time_window.1]));
-
-            frame.render_widget(chart, mixed_chart_layout[1]);
-
-            let chart2 = Chart::new(dataset_txs)
-                .block(
-                    ratatui::widgets::Block::new()
-                        .padding(Padding::new(
-                            0, // left
-                            1, // right
-                            0, // top
-                            0, // bottom
-                        ))
-                        .borders(Borders::LEFT)
-                        .border_style(Style::default().fg(Color::Blue)),
-                )
-                .y_axis(Axis::default().bounds([transaction_window.0, transaction_window.1]))
-                .x_axis(Axis::default().bounds([time_window.0, time_window.1]));
-
-            frame.render_widget(chart2, mixed_chart_layout[1]);
-
-            // frame.render_widget(Paragraph::new("Bottom"), layout[0]);
-            // frame.render_widget(Paragraph::new("Bottom"), layout[1]);
-        });
+                // frame.render_widget(Paragraph::new("Bottom"), layout[0]);
+                // frame.render_widget(Paragraph::new("Bottom"), layout[1]);
+            })
+            .unwrap();
     }
 
     async fn refresh(&mut self, pipeline: Option<&super::Pipeline>) -> Result<(), WorkerError> {
@@ -1138,13 +1135,13 @@ impl Log for TuiConsole {
 }
 
 struct PlainConsole {
-    last_report: Mutex<Instant>,
+    //last_report: Mutex<Instant>,
 }
 
 impl PlainConsole {
     fn new() -> Self {
         Self {
-            last_report: Mutex::new(Instant::now()),
+            //last_report: Mutex::new(Instant::now()),
         }
     }
 
@@ -1252,9 +1249,9 @@ lazy_static! {
         capacity: 100,
     };
 }
-pub async fn initialize(mode: Option<Mode>) {
+pub async fn initialize(mode: &Mode) {
     let logger = match mode {
-        Some(Mode::TUI) => Logger::Tui(TuiConsole::new()),
+        Mode::TUI => Logger::Tui(TuiConsole::new()),
         _ => Logger::Plain(PlainConsole::new()),
     };
 
@@ -1263,12 +1260,9 @@ pub async fn initialize(mode: Option<Mode>) {
         .unwrap();
 }
 
-pub async fn refresh(
-    mode: &Option<Mode>,
-    pipeline: Option<&super::Pipeline>,
-) -> Result<(), WorkerError> {
+pub async fn refresh(mode: &Mode, pipeline: Option<&super::Pipeline>) -> Result<(), WorkerError> {
     let mode = match mode {
-        Some(Mode::TUI) => TUI_CONSOLE.lock().await.refresh(pipeline).await,
+        Mode::TUI => TUI_CONSOLE.lock().await.refresh(pipeline).await,
         _ => PLAIN_CONSOLE.refresh(pipeline),
     };
 

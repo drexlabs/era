@@ -1,23 +1,22 @@
-use std::sync::Arc;
-
-use bech32::{ToBase32, Variant};
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
+use futures::lock::Mutex;
+use futures::TryFutureExt;
+use gasket::messaging::OutputPort;
 use pallas::crypto::hash::Hash;
 use pallas::ledger::addresses::{Address, StakeAddress};
 use pallas::ledger::configs::byron::GenesisUtxo;
 use pallas::ledger::traverse::{MultiEraAsset, MultiEraBlock, MultiEraOutput, OutputRef};
-use serde::{Deserialize, Serialize};
+use pallas_bech32::cip14::AssetFingerprint;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::borrow::BorrowMut;
+use std::sync::Arc;
 
-use gasket::framework::WorkerError;
-use gasket::messaging::tokio::OutputPort;
-use tokio::sync::Mutex;
-
-use crate::model::{BlockContext, BlockOrigination, CRDTCommand};
+use crate::model::{BlockContext, CRDTCommand, DecodedBlockAction};
 use crate::pipeline::Context;
 use crate::{model, prelude::*};
 
-#[derive(Deserialize, Clone)]
+const ERROR_MSG: &str = "could not send gasket message from utxo reducer";
+
+#[derive(Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
     pub coin_key_prefix: Option<String>,
@@ -34,10 +33,10 @@ impl Default for Config {
     }
 }
 
-#[derive(Clone)]
 pub struct Reducer {
     config: Config,
-    ctx: Arc<Mutex<Context>>,
+    ctx: Arc<Context>,
+    output: OutputPort<CRDTCommand>,
 }
 
 // hash and index are stored in the key
@@ -50,16 +49,9 @@ pub struct DropKingMultiAssetUTXO {
     fingerprint: String,
 }
 
-fn asset_fingerprint(data_list: [&str; 2]) -> Result<String, bech32::Error> {
-    let combined_parts = data_list.join("");
-    let raw = hex::decode(combined_parts).unwrap();
-    let mut hasher = Blake2bVar::new(20).unwrap();
-    hasher.update(&raw);
-    let mut buf = [0u8; 20];
-    hasher.finalize_variable(&mut buf).unwrap();
-    let base32_combined = buf.to_base32();
-    bech32::encode("asset", base32_combined, Variant::Bech32)
-}
+// fn asset_fingerprint(_data_list: [&str; 2]) -> Result<String, Error> {
+//     Ok("".to_string())
+// }
 
 impl Reducer {
     fn stake_or_address_from_address(&self, address: &Address) -> String {
@@ -74,64 +66,58 @@ impl Reducer {
         }
     }
 
-    async fn tx_state(
-        &mut self,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
-        soa: &str,
-        tx_str: &str,
-        should_exist: bool,
-    ) -> Result<(), Error> {
-        output
-            .lock()
-            .await
-            .send(gasket::messaging::Message::from(match should_exist {
-                true => CRDTCommand::set_add(
-                    self.config.key_prefix.clone().as_deref(),
-                    &soa,
-                    tx_str.to_string(),
-                ),
+    async fn tx_state(&mut self, soa: &str, tx_str: &str, should_exist: bool) -> Result<(), Error> {
+        self.output
+            .send(
+                match should_exist {
+                    true => CRDTCommand::set_add(
+                        self.config.key_prefix.clone().as_deref(),
+                        &soa,
+                        tx_str.to_string(),
+                    ),
 
-                false => CRDTCommand::set_remove(
-                    self.config.key_prefix.clone().as_deref(),
-                    &soa,
-                    tx_str.to_string(),
-                ),
-            }))
+                    false => CRDTCommand::set_remove(
+                        self.config.key_prefix.clone().as_deref(),
+                        &soa,
+                        tx_str.to_string(),
+                    ),
+                }
+                .into(),
+            )
             .await
-            .map_err(|_| Error::GasketError(WorkerError::Send))
+            .map_err(|_| Error::message(ERROR_MSG))
     }
 
     async fn coin_state(
         &mut self,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
         address: &str,
         tx_str: &str,
         lovelace_amt: &str,
         should_exist: bool,
     ) -> Result<(), Error> {
-        output
-            .lock()
-            .await
-            .send(gasket::messaging::Message::from(match should_exist {
-                true => CRDTCommand::set_add(
-                    self.config.coin_key_prefix.clone().as_deref(),
-                    tx_str,
-                    format!("{}/{}", address, lovelace_amt),
-                ),
+        self.output
+            .send(
+                match should_exist {
+                    true => CRDTCommand::set_add(
+                        self.config.coin_key_prefix.clone().as_deref(),
+                        tx_str,
+                        format!("{}/{}", address, lovelace_amt),
+                    ),
 
-                false => CRDTCommand::set_remove(
-                    self.config.coin_key_prefix.clone().as_deref(),
-                    tx_str,
-                    format!("{}/{}", address, lovelace_amt),
-                ),
-            }))
+                    false => CRDTCommand::set_remove(
+                        self.config.coin_key_prefix.clone().as_deref(),
+                        tx_str,
+                        format!("{}/{}", address, lovelace_amt),
+                    ),
+                }
+                .into(),
+            )
             .await
-            .map_err(|_| Error::GasketError(WorkerError::Send))
+            .map_err(|_| Error::message(ERROR_MSG))
     }
 
     async fn token_state(
         &mut self,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
         address: &str,
         tx_str: &str,
         policy_id: &str,
@@ -139,61 +125,64 @@ impl Reducer {
         quantity: &str,
         should_exist: bool,
     ) -> Result<(), Error> {
-        output
-            .lock()
-            .await
-            .send(gasket::messaging::Message::from(match should_exist {
-                true => CRDTCommand::set_add(
-                    self.config.key_prefix.clone().as_deref(),
-                    tx_str,
-                    format!("{}/{}/{}/{}", address, policy_id, fingerprint, quantity),
-                ),
+        self.output
+            .send(
+                match should_exist {
+                    true => CRDTCommand::set_add(
+                        self.config.key_prefix.clone().as_deref(),
+                        tx_str,
+                        format!("{}/{}/{}/{}", address, policy_id, fingerprint, quantity),
+                    ),
 
-                _ => CRDTCommand::set_remove(
-                    self.config.key_prefix.clone().as_deref(),
-                    tx_str,
-                    format!("{}/{}/{}/{}", address, policy_id, fingerprint, quantity),
-                ),
-            }))
+                    _ => CRDTCommand::set_remove(
+                        self.config.key_prefix.clone().as_deref(),
+                        tx_str,
+                        format!("{}/{}/{}/{}", address, policy_id, fingerprint, quantity),
+                    ),
+                }
+                .into(),
+            )
             .await
-            .map_err(|_| Error::GasketError(WorkerError::Send))
+            .map_err(|_| Error::message(ERROR_MSG))
     }
 
     async fn datum_state<'b>(
         &mut self,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
         address: &str,
         tx_str: &str,
         utxo: &'b MultiEraOutput<'b>,
         should_exist: bool,
     ) -> Result<(), Error> {
-        match utxo.datum() {
+        if let Some(output) = match utxo.datum() {
             Some(datum) => match datum {
                 pallas::ledger::primitives::babbage::PseudoDatumOption::Data(datum) => {
                     let raw_cbor_bytes: &[u8] = datum.0.raw_cbor();
 
-                    output
-                        .lock()
-                        .await
-                        .send(gasket::messaging::Message::from(match should_exist {
-                            true => CRDTCommand::set_add(
-                                self.config.datum_key_prefix.clone().as_deref(),
-                                tx_str,
-                                format!("{}/{}", address, hex::encode(raw_cbor_bytes)),
-                            ),
-                            false => CRDTCommand::set_remove(
-                                self.config.datum_key_prefix.clone().as_deref(),
-                                tx_str,
-                                format!("{}/{}", address, hex::encode(raw_cbor_bytes)),
-                            ),
-                        }))
-                        .await
-                        .map_err(|_| Error::GasketError(WorkerError::Send))
+                    Some(match should_exist {
+                        true => CRDTCommand::set_add(
+                            self.config.datum_key_prefix.clone().as_deref(),
+                            tx_str,
+                            format!("{}/{}", address, hex::encode(raw_cbor_bytes)),
+                        ),
+                        false => CRDTCommand::set_remove(
+                            self.config.datum_key_prefix.clone().as_deref(),
+                            tx_str,
+                            format!("{}/{}", address, hex::encode(raw_cbor_bytes)),
+                        ),
+                    })
                 }
 
-                _ => Ok(()),
+                _ => None,
             },
-            None => Ok(()),
+            None => None,
+        } {
+            return self
+                .output
+                .send(output.into())
+                .await
+                .map_err(|_| Error::message(ERROR_MSG));
+        } else {
+            return Ok(());
         }
     }
 
@@ -201,10 +190,9 @@ impl Reducer {
         &mut self,
         ctx: &model::BlockContext,
         input: &OutputRef,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
         rollback: bool,
     ) -> Result<(), Error> {
-        let utxo = ctx.find_utxo(input)?;
+        let utxo = ctx.find_utxo(input).unwrap();
 
         let address = utxo.address().map(|x| x.to_string()).unwrap();
 
@@ -215,7 +203,6 @@ impl Reducer {
         if let Ok(raw_address) = utxo.address() {
             let soa = self.stake_or_address_from_address(&raw_address);
             self.tx_state(
-                output.clone(),
                 soa.as_str(),
                 &format!("{}#{}", input.hash(), input.index()),
                 rollback,
@@ -223,7 +210,6 @@ impl Reducer {
             .await?;
 
             self.datum_state(
-                output.clone(),
                 soa.as_str(),
                 &format!("{}#{}", input.hash(), input.index()),
                 &utxo,
@@ -232,7 +218,6 @@ impl Reducer {
             .await?;
 
             self.coin_state(
-                output.clone(),
                 raw_address
                     .to_bech32()
                     .unwrap_or(raw_address.to_string())
@@ -253,12 +238,10 @@ impl Reducer {
                     let asset_name = hex::encode(asset_name.to_vec());
 
                     if let Ok(fingerprint) =
-                        asset_fingerprint([&hex::encode(policy_id), &asset_name])
+                        AssetFingerprint::from_parts(&hex::encode(policy_id), &asset_name)
                     {
-                        // todo confirm this check is unneeded
-                        if !fingerprint.is_empty() {
+                        if let Ok(fingerprint) = fingerprint.finger_print() {
                             self.token_state(
-                                output.clone(),
                                 &address,
                                 format!("{}#{}", input.hash(), input.index()).as_str(),
                                 &hex::encode(policy_id),
@@ -266,7 +249,7 @@ impl Reducer {
                                 quantity.to_string().as_str(),
                                 rollback,
                             )
-                            .await?;
+                            .await?
                         }
                     }
                 };
@@ -281,14 +264,12 @@ impl Reducer {
         tx_hash: &Hash<32>,
         tx_output: &'b MultiEraOutput<'b>,
         output_idx: usize,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
         rollback: bool,
     ) -> Result<(), Error> {
         if let Ok(raw_address) = tx_output.address() {
             let tx_address = raw_address.to_bech32().unwrap_or(raw_address.to_string());
 
             self.coin_state(
-                output.clone(),
                 &tx_address,
                 &format!("{}#{}", tx_hash, output_idx),
                 tx_output.lovelace_amount().to_string().as_str(),
@@ -297,7 +278,6 @@ impl Reducer {
             .await?;
 
             self.datum_state(
-                output.clone(),
                 &tx_address,
                 &format!("{}#{}", tx_hash, output_idx),
                 tx_output,
@@ -313,20 +293,22 @@ impl Reducer {
                         let asset_name = hex::encode(asset_name.to_vec());
                         let policy_id_str = hex::encode(policy_id);
 
-                        if let Ok(fingerprint) =
-                            asset_fingerprint([&policy_id_str, asset_name.as_str()])
-                        {
-                            if !fingerprint.is_empty() {
-                                self.token_state(
-                                    output.clone(),
-                                    &tx_address,
-                                    format!("{}#{}", tx_hash, output_idx).as_str(),
-                                    &policy_id_str,
-                                    &fingerprint,
-                                    quantity.to_string().as_str(),
-                                    !rollback,
-                                )
-                                .await?;
+                        if let Ok(fingerprint) = AssetFingerprint::from_parts(
+                            &hex::encode(policy_id_str.clone()),
+                            &asset_name,
+                        ) {
+                            if let Ok(fingerprint) = fingerprint.finger_print() {
+                                if !fingerprint.is_empty() {
+                                    self.token_state(
+                                        &tx_address,
+                                        format!("{}#{}", tx_hash, output_idx).as_str(),
+                                        &policy_id_str,
+                                        &fingerprint,
+                                        quantity.to_string().as_str(),
+                                        !rollback,
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                     };
@@ -335,7 +317,6 @@ impl Reducer {
 
             let soa = self.stake_or_address_from_address(&raw_address);
             self.tx_state(
-                output,
                 soa.as_str(),
                 &format!("{}#{}", tx_hash, output_idx),
                 !rollback,
@@ -346,29 +327,29 @@ impl Reducer {
         Ok(())
     }
 
-    pub async fn reduce<'b>(
-        &mut self,
-        block: Option<MultiEraBlock<'b>>,
-        block_ctx: Option<model::BlockContext>,
-        genesis_utxos: Option<Vec<GenesisUtxo>>,
-        rollback: bool,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
-    ) -> Result<(), gasket::framework::WorkerError> {
-        match (block, genesis_utxos) {
-            (Some(block), _) => {
-                let block_ctx = &block_ctx.unwrap_or(BlockContext::default());
+    pub async fn reduce<'a>(&mut self, mode: &'a DecodedBlockAction<'a>) -> Result<(), Error> {
+        match mode {
+            DecodedBlockAction::Genesis(genesis_utxo) => {
+                for utxo in genesis_utxo {
+                    let address = hex::encode(utxo.1.to_vec());
+                    let key = format!("{}#{}", hex::encode(utxo.0), 0);
 
-                for tx in block.txs() {
+                    self.tx_state(&address, &key, true).await?;
+
+                    self.coin_state(&address, &key, &utxo.2.to_string(), false)
+                        .await?
+                }
+
+                Ok(())
+            }
+
+            action @ (DecodedBlockAction::Forward(b, c, _)
+            | DecodedBlockAction::Rollback(b, c, _)) => {
+                let is_rollback = action.is_rollback();
+                for tx in b.txs() {
                     if tx.is_valid() {
                         for consumed in tx.consumes().iter().map(|i| i.output_ref()) {
-                            self.process_consumed_txo(
-                                &block_ctx,
-                                &consumed,
-                                output.clone(),
-                                rollback,
-                            )
-                            .await
-                            .or_else(|_| Err(()));
+                            self.process_consumed_txo(c, &consumed, is_rollback).await?;
                         }
 
                         for (idx, produced) in tx.produces().iter() {
@@ -376,44 +357,25 @@ impl Reducer {
                                 &tx.hash(),
                                 produced,
                                 idx.clone(),
-                                output.clone(),
-                                rollback,
+                                is_rollback,
                             )
-                            .await
-                            .or_panic()?;
+                            .await?;
                         }
                     }
                 }
 
                 Ok(())
             }
-
-            (_, Some(genesis_utxos)) => {
-                for utxo in genesis_utxos {
-                    let address = hex::encode(utxo.1.to_vec());
-                    let key = format!("{}#{}", hex::encode(utxo.0), 0);
-
-                    self.tx_state(output.clone(), &address, &key, true)
-                        .await
-                        .or_panic()?;
-
-                    self.coin_state(output.clone(), &address, &key, &utxo.2.to_string(), false)
-                        .await
-                        .or_panic()?;
-                }
-
-                Ok(())
-            }
-
-            _ => Err(gasket::framework::WorkerError::Panic),
         }
     }
 }
 
 impl Config {
-    pub fn plugin(self, ctx: Arc<Mutex<Context>>) -> super::Reducer {
-        let reducer = Reducer { config: self, ctx };
-
-        super::Reducer::Utxo(reducer)
+    pub fn plugin(self, ctx: Arc<Context>) -> super::Reducer {
+        super::Reducer::Utxo(Reducer {
+            config: self,
+            ctx,
+            output: Default::default(),
+        })
     }
 }

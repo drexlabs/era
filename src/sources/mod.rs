@@ -1,14 +1,20 @@
 use std::sync::Arc;
 
-use crate::{model, pipeline, storage::Cursor};
-use gasket::{messaging::tokio::OutputPort, runtime::Tether};
+use crate::{
+    model,
+    pipeline::{self, Context},
+    storage::Cursor,
+};
+use gasket::{
+    messaging::OutputPort,
+    runtime::{Policy, Tether},
+};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
 pub mod utils;
 
 pub mod n2n;
-pub mod utxorpc;
 
 #[cfg(target_family = "unix")]
 pub mod n2c;
@@ -18,18 +24,12 @@ pub mod n2c;
 pub enum Config {
     N2C(n2c::Config),
     N2N(n2n::Config),
-    UTXORPC(utxorpc::Config),
 }
 
 impl Config {
-    pub fn bootstrapper(
-        self,
-        ctx: Arc<Mutex<pipeline::Context>>,
-        cursor: Cursor,
-    ) -> Option<Bootstrapper> {
+    pub fn bootstrapper(self, ctx: Arc<Context>, cursor: Cursor) -> Option<Bootstrapper> {
         match self {
             Config::N2N(c) => Some(Bootstrapper::N2N(c.bootstrapper(ctx, cursor))),
-            Config::UTXORPC(c) => Some(Bootstrapper::UTXORPC(c.bootstrapper(ctx, cursor))),
             Config::N2C(c) => Some(Bootstrapper::N2C(c.bootstrapper(ctx, cursor))),
         }
     }
@@ -38,7 +38,6 @@ impl Config {
 pub enum Bootstrapper {
     N2C(n2c::chainsync::Stage),
     N2N(n2n::chainsync::Stage),
-    UTXORPC(utxorpc::Stage),
 }
 
 impl Bootstrapper {
@@ -46,15 +45,13 @@ impl Bootstrapper {
         match self {
             Bootstrapper::N2C(s) => &mut s.output,
             Bootstrapper::N2N(s) => &mut s.output,
-            Bootstrapper::UTXORPC(s) => &mut s.output,
         }
     }
 
-    pub fn spawn_stage(self, pipeline: &pipeline::Pipeline) -> Tether {
+    pub fn spawn_stage(self, policy: Policy) -> Tether {
         match self {
-            Bootstrapper::N2C(s) => gasket::runtime::spawn_stage(s, pipeline.policy.clone()),
-            Bootstrapper::N2N(s) => gasket::runtime::spawn_stage(s, pipeline.policy.clone()),
-            Bootstrapper::UTXORPC(s) => gasket::runtime::spawn_stage(s, pipeline.policy.clone()),
+            Bootstrapper::N2C(s) => gasket::runtime::spawn_stage(s, policy),
+            Bootstrapper::N2N(s) => gasket::runtime::spawn_stage(s, policy),
         }
     }
 }

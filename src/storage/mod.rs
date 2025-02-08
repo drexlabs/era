@@ -1,14 +1,13 @@
 pub mod redis;
 pub mod skip;
 
-#[cfg(feature = "elastic")]
-pub mod elastic;
-
 use std::sync::Arc;
 
-use gasket::{messaging::tokio::InputPort, runtime::Tether};
+use gasket::{
+    messaging::InputPort,
+    runtime::{Policy, Tether},
+};
 use serde::Deserialize;
-use tokio::sync::Mutex;
 
 use crate::{
     crosscut::PointArg,
@@ -21,27 +20,18 @@ use crate::{
 pub enum Config {
     Skip(skip::Config),
     Redis(redis::Config),
-
-    #[cfg(feature = "elastic")]
-    Elastic(elastic::Config),
 }
 
 pub enum Stage {
     Skip(skip::Stage),
     Redis(redis::Stage),
-
-    #[cfg(feature = "elastic")]
-    Elastic(elastic::Stage),
 }
 
 impl Config {
-    pub fn bootstrapper(self, ctx: Arc<Mutex<Context>>) -> Option<Bootstrapper> {
+    pub fn bootstrapper(self, ctx: Arc<Context>) -> Option<Bootstrapper> {
         match self {
-            Config::Skip(c) => Some(Bootstrapper::Skip(c.bootstrapper(ctx))),
+            Config::Skip(c) => Some(Bootstrapper::Skip(c.bootstrapper())),
             Config::Redis(c) => Some(Bootstrapper::Redis(c.bootstrapper(ctx))),
-
-            #[cfg(feature = "elastic")]
-            Config::Elastic(c) => Some(Bootstrapper::Elastic(c.bootstrapper(ctx))),
         }
     }
 }
@@ -50,9 +40,6 @@ impl Config {
 pub enum Cursor {
     Skip,
     Redis(redis::Cursor),
-
-    #[cfg(feature = "elastic")]
-    Elastic(elastic::Cursor),
 }
 
 impl Cursor {
@@ -60,9 +47,6 @@ impl Cursor {
         match self {
             Cursor::Skip => Ok(None),
             Cursor::Redis(x) => x.last_point(),
-
-            #[cfg(feature = "elastic")]
-            Cursor::Elastic(x) => x.last_point(),
         }
     }
 }
@@ -70,9 +54,6 @@ impl Cursor {
 pub enum Bootstrapper {
     Skip(skip::Stage),
     Redis(redis::Stage),
-
-    #[cfg(feature = "elastic")]
-    Elastic(elastic::Stage),
 }
 
 impl Bootstrapper {
@@ -80,9 +61,6 @@ impl Bootstrapper {
         match self {
             Bootstrapper::Skip(_) => Cursor::Skip,
             Bootstrapper::Redis(x) => Cursor::Redis(x.cursor.clone()),
-
-            #[cfg(feature = "elastic")]
-            Bootstrapper::Elastic(x) => Cursor::Elastic(x.cursor.clone()),
         }
     }
 
@@ -90,15 +68,13 @@ impl Bootstrapper {
         match self {
             Bootstrapper::Skip(s) => &mut s.input,
             Bootstrapper::Redis(s) => &mut s.input,
-            Bootstrapper::Elastic(s) => &mut s.input,
         }
     }
 
-    pub fn spawn_stage(self, pipeline: &pipeline::Pipeline) -> Tether {
+    pub fn spawn_stage(self, policy: Policy) -> Tether {
         match self {
-            Bootstrapper::Skip(s) => gasket::runtime::spawn_stage(s, pipeline.policy.clone()),
-            Bootstrapper::Redis(s) => gasket::runtime::spawn_stage(s, pipeline.policy.clone()),
-            Bootstrapper::Elastic(s) => gasket::runtime::spawn_stage(s, pipeline.policy.clone()),
+            Bootstrapper::Skip(s) => gasket::runtime::spawn_stage(s, policy),
+            Bootstrapper::Redis(s) => gasket::runtime::spawn_stage(s, policy),
         }
     }
 }

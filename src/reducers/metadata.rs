@@ -1,35 +1,30 @@
-use std::ops::Deref;
 use std::sync::Arc;
 
-use bech32::{ToBase32, Variant};
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
-
+use futures::lock::Mutex;
+use gasket::messaging::OutputPort;
 use pallas::codec::utils::KeyValuePairs;
 use pallas::ledger::primitives::alonzo::{Metadatum, MetadatumLabel};
 use pallas::ledger::traverse::MultiEraBlock;
 
-use gasket::messaging::tokio::OutputPort;
-
+use pallas_bech32::cip14::AssetFingerprint;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
 
 use crate::crosscut;
-use crate::model::{CRDTCommand, Delta};
+use crate::model::{CRDTCommand, DecodedBlockAction, Delta};
 use crate::pipeline::Context;
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
     pub royalty_key_prefix: Option<String>,
     pub filter: Option<crosscut::filters::Predicate>,
 }
 
-#[derive(Clone)]
 pub struct Reducer {
     config: Config,
-    ctx: Arc<Mutex<Context>>,
+    ctx: Arc<Context>,
+    output: OutputPort<CRDTCommand>,
 }
 
 const CIP25_META_NFT: u64 = 721;
@@ -57,7 +52,7 @@ fn kv_pairs_to_hashmap(
     }
 
     let mut hashmap = serde_json::Map::new();
-    for (key, value) in kv_pairs.deref() {
+    for (key, value) in kv_pairs.iter() {
         if let Metadatum::Text(key_str) = key {
             hashmap.insert(key_str.clone(), metadatum_to_value(value));
         }
@@ -68,7 +63,7 @@ fn kv_pairs_to_hashmap(
 
 impl Reducer {
     fn find_metadata_policy_assets(
-        &self,
+        &mut self,
         metadata: &Metadatum,
         target_policy_id: &str,
     ) -> Option<KeyValuePairs<Metadatum, Metadatum>> {
@@ -90,19 +85,7 @@ impl Reducer {
         }
     }
 
-    fn asset_fingerprint(&self, data_list: [&str; 2]) -> Result<String, bech32::Error> {
-        let combined_parts = data_list.join("");
-        let raw = hex::decode(combined_parts).unwrap();
-
-        let mut hasher = Blake2bVar::new(20).unwrap();
-        hasher.update(&raw);
-        let mut buf = [0u8; 20];
-        hasher.finalize_variable(&mut buf).unwrap();
-        let base32_combined = buf.to_base32();
-        bech32::encode("asset", base32_combined, Variant::Bech32)
-    }
-
-    fn get_asset_label(&self, l: Metadatum) -> Result<String, &str> {
+    fn get_asset_label(&mut self, l: Metadatum) -> Result<String, &str> {
         match l {
             Metadatum::Text(l) => Ok(l),
             Metadatum::Int(l) => Ok(l.to_string()),
@@ -138,15 +121,14 @@ impl Reducer {
     }
 
     async fn extract_and_aggregate_cip_metadata(
-        &self,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
+        &mut self,
         cip: u64,
         policy_map: Metadatum,
         policy_id_str: String,
         asset_name_str: String,
-        rollback: bool,
-        prefix: &str,
-        royalty_prefix: &str,
+        is_rollback: bool, // todo: rollbacks on metadata appear not to be supported
+        prefix: String,
+        royalty_prefix: String,
         timestamp: u64,
     ) -> Result<(), gasket::error::Error> {
         if let Some(policy_assets) = self.find_metadata_policy_assets(&policy_map, &policy_id_str) {
@@ -156,10 +138,12 @@ impl Reducer {
             });
 
             if let Some((_, Metadatum::Map(asset_metadata))) = filtered_policy_assets {
-                if let Ok(fingerprint_str) = self.asset_fingerprint([
-                    &policy_id_str.clone(),
+                if let Ok(fingerprint) = AssetFingerprint::from_parts(
+                    &policy_id_str,
                     hex::encode(&asset_name_str).as_str(),
-                ]) {
+                ) {
+                    let fingerprint_str = fingerprint.finger_print().unwrap();
+
                     // let metadata_final: Metadata = self.get_wrapped_metadata_fragment(
                     //     cip,
                     //     asset_name_str.clone(),
@@ -177,11 +161,9 @@ impl Reducer {
                     if !meta_payload.is_empty()
                         && (cip == CIP25_META_NFT || cip == CIP27_META_ROYALTIES)
                     {
-                        output
-                            .lock()
-                            .await
+                        self.output
                             .send(gasket::messaging::Message::from(match cip {
-                                CIP27_META_ROYALTIES => match rollback {
+                                CIP27_META_ROYALTIES => match is_rollback {
                                     false => CRDTCommand::last_write_wins(
                                         Some(&royalty_prefix),
                                         &policy_id_str,
@@ -196,7 +178,7 @@ impl Reducer {
                                     ),
                                 },
 
-                                CIP25_META_NFT => match rollback {
+                                CIP25_META_NFT => match is_rollback {
                                     false => CRDTCommand::last_write_wins(
                                         Some(&prefix),
                                         &fingerprint_str,
@@ -223,20 +205,26 @@ impl Reducer {
         Ok(())
     }
 
-    pub async fn reduce<'b>(
+    pub async fn reduce<'a>(
         &mut self,
-        block: Option<MultiEraBlock<'b>>,
-        rollback: bool,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
-    ) -> Result<(), gasket::framework::WorkerError> {
+        block: &'a DecodedBlockAction<'a>,
+    ) -> Result<(), crate::Error> {
         match block {
-            Some(block) => {
-                let prefix = self.config.key_prefix.as_deref().unwrap_or("m");
-                let royalty_prefix = self.config.royalty_key_prefix.as_deref().unwrap_or("m.r");
+            //todo: genesis metadata unsupported (if it even exists)
+            DecodedBlockAction::Genesis(..) => Ok(()),
 
-                let time_provider = crosscut::time::NaiveProvider::new(self.ctx.clone()).await;
+            action @ (DecodedBlockAction::Forward(b, ..) | DecodedBlockAction::Rollback(b, ..)) => {
+                let is_rollback = action.is_rollback();
+                let prefix = self.config.key_prefix.clone().unwrap_or("m".to_string());
+                let royalty_prefix = self
+                    .config
+                    .royalty_key_prefix
+                    .clone()
+                    .unwrap_or("m.r".to_string());
 
-                for tx in block.txs() {
+                let time_provider = crosscut::time::NaiveProvider::new(Arc::clone(&self.ctx)).await;
+
+                for tx in b.txs() {
                     for asset_group in tx.mints() {
                         for multi_asset in asset_group.assets() {
                             let policy_id_str = hex::encode(multi_asset.policy());
@@ -249,7 +237,7 @@ impl Reducer {
 
                                 if !policy_id_str.is_empty() {
                                     for supported_metadata_cip in
-                                        vec![CIP25_META_NFT, CIP27_META_ROYALTIES]
+                                        [CIP25_META_NFT, CIP27_META_ROYALTIES]
                                     {
                                         if let Some(policy_map) = tx
                                             .metadata()
@@ -257,19 +245,18 @@ impl Reducer {
                                         {
                                             if quantity > -1 {
                                                 self.extract_and_aggregate_cip_metadata(
-                                                    output.clone(),
                                                     supported_metadata_cip,
                                                     policy_map.clone(),
                                                     policy_id_str.clone(),
                                                     asset_name_str.clone(),
-                                                    rollback,
-                                                    prefix,
-                                                    royalty_prefix,
+                                                    is_rollback,
+                                                    prefix.clone(),
+                                                    royalty_prefix.clone(),
                                                     time_provider
-                                                        .slot_to_wallclock(block.slot().clone()),
+                                                        .slot_to_wallclock(b.slot().clone()),
                                                 )
                                                 .await
-                                                .unwrap_or(());
+                                                .map_err(|e| crate::Error::reducer(e))?;
                                             }
                                         }
                                     }
@@ -278,19 +265,19 @@ impl Reducer {
                         }
                     }
                 }
+
+                Ok(())
             }
-
-            None => {} // skip block if this is a genesis set
         }
-
-        Ok(())
     }
 }
 
 impl Config {
-    pub fn plugin(self, ctx: Arc<Mutex<Context>>) -> super::Reducer {
-        let worker = Reducer { config: self, ctx };
-
-        super::Reducer::Metadata(worker)
+    pub fn plugin(self, ctx: Arc<Context>) -> super::Reducer {
+        super::Reducer::Metadata(Reducer {
+            config: self,
+            output: Default::default(),
+            ctx,
+        })
     }
 }

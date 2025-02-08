@@ -1,24 +1,20 @@
-use crate::model::CRDTCommand;
+use crate::model::{CRDTCommand, DecodedBlockAction};
 use crate::pipeline::Context;
 use crate::{crosscut, model, prelude::*};
-use gasket::framework::WorkerError;
-use gasket::messaging::tokio::OutputPort;
-use pallas::crypto::hash::Hash;
+use gasket::messaging::OutputPort;
 use pallas::ledger::configs::byron::GenesisUtxo;
-use pallas::ledger::traverse::MultiEraBlock;
 use pallas::ledger::traverse::{
     MultiEraAsset, MultiEraInput, MultiEraOutput, MultiEraPolicyAssets,
 };
+use pallas_bech32::cip14::AssetFingerprint;
 use serde::{Deserialize, Serialize};
 
-use bech32::{ToBase32, Variant};
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
 use pallas::ledger::addresses::{Address, StakeAddress};
 use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+
+const ERROR_MSG: &str = "could not send gasket message from assets_balances reducer";
 
 #[derive(Serialize, Deserialize)]
 struct MultiAssetSingleAgg {
@@ -30,7 +26,7 @@ struct MultiAssetSingleAgg {
     fingerprint: String,
 }
 
-#[derive(Deserialize, Copy, Clone)]
+#[derive(Deserialize)]
 pub enum Projection {
     Cbor,
     Json,
@@ -42,27 +38,16 @@ struct PreviousOwnerAgg {
     transferred_out: i64,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
     pub filter: Option<crosscut::filters::Predicate>,
 }
 
-fn asset_fingerprint(data_list: [&str; 2]) -> Result<String, bech32::Error> {
-    let combined_parts = data_list.join("");
-    let raw = hex::decode(combined_parts).unwrap();
-    let mut hasher = Blake2bVar::new(20).unwrap();
-    hasher.update(&raw);
-    let mut buf = [0u8; 20];
-    hasher.finalize_variable(&mut buf).unwrap();
-    let base32_combined = buf.to_base32();
-    bech32::encode("asset", base32_combined, Variant::Bech32)
-}
-
-#[derive(Clone)]
 pub struct Reducer {
     config: Config,
-    ctx: Arc<Mutex<Context>>,
+    ctx: Arc<Context>,
+    output: OutputPort<CRDTCommand>,
 }
 
 impl Reducer {
@@ -80,7 +65,7 @@ impl Reducer {
 
     fn calculate_address_asset_balance_offsets(
         &self,
-        address: &String,
+        address: &str,
         lovelace: i64,
         assets_group: &Vec<MultiEraPolicyAssets>,
         spending: bool,
@@ -100,15 +85,17 @@ impl Reducer {
                     let asset_name = hex::encode(asset_name.to_vec());
                     let encoded_policy_id = hex::encode(policy_id);
 
-                    if let Ok(fingerprint) = asset_fingerprint([&encoded_policy_id, &asset_name]) {
-                        if !fingerprint.is_empty() {
+                    if let Ok(fingerprint) =
+                        AssetFingerprint::from_parts(&encoded_policy_id, &asset_name)
+                    {
+                        if let Ok(fingerprint) = fingerprint.finger_print() {
                             let adjusted_quantity: i64 = match spending {
                                 true => -(quantity as i64),
                                 false => quantity as i64,
                             };
 
                             *fingerprint_tallies
-                                .entry(address.clone())
+                                .entry(address.clone().to_string())
                                 .or_insert(HashMap::new())
                                 .entry(fingerprint.clone())
                                 .or_insert(0_i64) += adjusted_quantity;
@@ -118,7 +105,7 @@ impl Reducer {
                                 .or_insert(HashMap::new())
                                 .entry(fingerprint)
                                 .or_insert(Vec::new())
-                                .push((address.clone(), adjusted_quantity));
+                                .push((address.to_string(), adjusted_quantity));
                         }
                     }
                 };
@@ -135,11 +122,10 @@ impl Reducer {
     }
 
     async fn process_asset_movement<'a>(
-        &self,
-        output: Arc<Mutex<OutputPort<model::CRDTCommand>>>,
-        soa: &String,
+        &mut self,
+        soa: &str,
         lovelace: u64,
-        assets: &'a Vec<MultiEraPolicyAssets<'a>>,
+        assets: &Vec<MultiEraPolicyAssets<'a>>,
         spending: bool,
         time: u64,
     ) -> Result<(), Error> {
@@ -148,8 +134,8 @@ impl Reducer {
             false => lovelace as i64,
         };
 
-        let (fingerprint_tallies, policy_asset_owners) =
-            self.calculate_address_asset_balance_offsets(soa, adjusted_lovelace, assets, spending);
+        let (fingerprint_tallies, policy_asset_owners) = self
+            .calculate_address_asset_balance_offsets(&soa, adjusted_lovelace, &assets, spending);
 
         let prefix = self.config.key_prefix.clone().unwrap_or("w".to_string());
 
@@ -157,9 +143,7 @@ impl Reducer {
             for (soa, quantity_map) in fingerprint_tallies.clone() {
                 for (fingerprint, quantity) in quantity_map {
                     if !fingerprint.is_empty() {
-                        output
-                            .lock()
-                            .await
+                        self.output
                             .send(
                                 model::CRDTCommand::HashCounter(
                                     format!("{}.{}", prefix, soa),
@@ -169,13 +153,11 @@ impl Reducer {
                                 .into(),
                             )
                             .await
-                            .map_err(|_| Error::gasket(WorkerError::Send))?;
+                            .map_err(|e| Error::reducer(e))?;
                     }
                 }
 
-                output
-                    .lock()
-                    .await
+                self.output
                     .send(
                         model::CRDTCommand::AnyWriteWins(
                             format!("{}.l.{}", prefix, soa),
@@ -184,7 +166,7 @@ impl Reducer {
                         .into(),
                     )
                     .await
-                    .map_err(|_| Error::gasket(WorkerError::Send))?;
+                    .map_err(|e| Error::reducer(e))?;
             }
         }
 
@@ -192,9 +174,7 @@ impl Reducer {
             for (policy_id, asset_to_owner) in policy_asset_owners {
                 if spending {
                     // may have lost some stuff in this reducer around this area
-                    output
-                        .lock()
-                        .await
+                    self.output
                         .send(
                             model::CRDTCommand::AnyWriteWins(
                                 format!("{}.lp.{}", prefix, policy_id),
@@ -203,16 +183,14 @@ impl Reducer {
                             .into(),
                         )
                         .await
-                        .map_err(|_| Error::gasket(WorkerError::Send))?;
+                        .map_err(|e| Error::reducer(e))?;
                 }
 
                 for (fingerprint, soas) in asset_to_owner {
                     for (soa, quantity) in soas {
                         if !soa.is_empty() {
                             if quantity != 0 {
-                                output
-                                    .lock()
-                                    .await
+                                self.output
                                     .send(
                                         model::CRDTCommand::HashCounter(
                                             format!("{}.owned.{}", prefix, fingerprint),
@@ -222,7 +200,7 @@ impl Reducer {
                                         .into(),
                                     )
                                     .await
-                                    .map_err(|_| Error::gasket(WorkerError::Send))?;
+                                    .map_err(|e| Error::reducer(e))?;
                             }
                         }
                     }
@@ -233,11 +211,11 @@ impl Reducer {
         Ok(())
     }
 
+    // todo cleanup None case and need for Some wrapper in the internal match
     async fn process_received<'a>(
-        &self,
-        output: Arc<Mutex<OutputPort<model::CRDTCommand>>>,
-        meo: Option<MultiEraOutput<'a>>,
-        genesis_utxo: Option<GenesisUtxo>,
+        &mut self,
+        meo: Option<&MultiEraOutput<'a>>,
+        genesis_utxo: Option<&GenesisUtxo>,
         rollback: bool,
         timeslot: u64,
     ) -> Result<(), Error> {
@@ -246,10 +224,9 @@ impl Reducer {
                 let received_to_soa = self.stake_or_address_from_address(&meo.address().unwrap());
 
                 self.process_asset_movement(
-                    output,
-                    &received_to_soa,
-                    meo.lovelace_amount(),
-                    &meo.non_ada_assets(),
+                    received_to_soa.as_str(),
+                    meo.value().coin(),
+                    &meo.value().assets(),
                     rollback,
                     timeslot,
                 )
@@ -258,24 +235,22 @@ impl Reducer {
 
             (None, Some(genesis_utxo)) => {
                 self.process_asset_movement(
-                    output,
-                    &hex::encode(genesis_utxo.1.to_vec()),
+                    hex::encode(genesis_utxo.1.to_vec()).as_str(),
                     genesis_utxo.2,
                     &Vec::default(),
-                    false,
+                    rollback,
                     timeslot,
                 )
                 .await
             }
 
-            _ => Err(Error::gasket(WorkerError::Panic)),
+            _ => Ok(()),
         }
     }
 
     async fn process_spent<'a>(
-        &self,
-        output: Arc<Mutex<OutputPort<model::CRDTCommand>>>,
-        mei: &'a MultiEraInput<'a>,
+        &mut self,
+        mei: &MultiEraInput<'a>,
         ctx: &model::BlockContext,
         rollback: bool,
         timeslot: u64,
@@ -285,82 +260,74 @@ impl Reducer {
                 let spent_from_soa =
                     self.stake_or_address_from_address(&spent_output.address().unwrap());
 
+                let val = spent_output.value().clone();
+
                 self.process_asset_movement(
-                    output,
                     &spent_from_soa,
-                    spent_output.lovelace_amount(),
-                    &spent_output.non_ada_assets(),
+                    spent_output.value().coin(),
+                    &val.assets(),
                     !rollback,
                     timeslot,
                 )
                 .await
             }
 
-            Err(_) => Ok(()),
+            Err(_) => Ok(()), // todo: disgusting
         }
     }
 
-    pub async fn reduce<'b>(
-        &mut self,
-        block: Option<MultiEraBlock<'b>>,
-        block_ctx: Option<model::BlockContext>,
-        genesis_utxos: Option<Vec<GenesisUtxo>>,
-        rollback: bool,
-        output: Arc<Mutex<OutputPort<CRDTCommand>>>,
-    ) -> Result<(), gasket::framework::WorkerError> {
-        match (block, block_ctx, genesis_utxos) {
-            (Some(block), Some(block_ctx), _) => {
-                let slot = block.slot();
-                let time_provider = crosscut::time::NaiveProvider::new(self.ctx.clone()).await;
+    // todo refactor all these reducers
+    pub async fn reduce<'a>(&mut self, block: &'a DecodedBlockAction<'a>) -> Result<(), Error> {
+        match block {
+            DecodedBlockAction::Genesis(genesis_utxo) => {
+                for utxo in genesis_utxo {
+                    self.process_received(None, Some(&utxo), false, 0).await?;
+                }
 
-                for tx in block.txs() {
+                Ok(())
+            }
+
+            action @ (DecodedBlockAction::Forward(b, c, p)
+            | DecodedBlockAction::Rollback(b, c, p)) => {
+                let is_rollback = action.is_rollback();
+
+                let slot = b.slot();
+                let time_provider = crosscut::time::NaiveProvider::new(Arc::clone(&self.ctx)).await;
+
+                for tx in b.txs() {
                     for consumes in tx.consumes().iter() {
                         self.process_spent(
-                            output.clone(),
                             consumes,
-                            &block_ctx,
-                            rollback,
+                            c,
+                            is_rollback,
                             time_provider.slot_to_wallclock(slot),
                         )
-                        .await
-                        .or_panic()?;
+                        .await?;
                     }
 
                     for (_, utxo_produced) in tx.produces().iter() {
                         self.process_received(
-                            output.clone(),
-                            Some(utxo_produced.clone()),
+                            Some(&utxo_produced),
                             None,
-                            rollback,
+                            is_rollback,
                             time_provider.slot_to_wallclock(slot),
                         )
-                        .await
-                        .or_panic()?;
+                        .await?;
                     }
                 }
 
                 Ok(())
             }
-
-            (None, None, Some(genesis_utxos)) => {
-                for utxo in genesis_utxos {
-                    self.process_received(output.clone(), None, Some(utxo), false, 0)
-                        .await
-                        .or_panic()?;
-                }
-
-                Ok(())
-            }
-
-            _ => Err(gasket::framework::WorkerError::Panic),
         }
     }
 }
 
 impl Config {
-    pub fn plugin(self, ctx: Arc<Mutex<Context>>) -> super::Reducer {
-        let reducer = Reducer { config: self, ctx };
-
-        super::Reducer::AssetsBalances(reducer)
+    pub fn plugin(self, ctx: Arc<Context>) -> super::Reducer {
+        super::Reducer::AssetsBalances(Reducer {
+            config: self,
+            output: Default::default(),
+            ctx,
+        })
     }
 }

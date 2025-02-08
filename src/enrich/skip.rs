@@ -1,5 +1,8 @@
-use gasket::framework::*;
-use gasket::messaging::tokio::{InputPort, OutputPort};
+use gasket::{
+    framework::*,
+    messaging::{InputPort, OutputPort},
+};
+use pallas::network::miniprotocols::Point;
 
 use crate::model::{BlockContext, EnrichedBlockPayload, RawBlockPayload};
 use serde::Deserialize;
@@ -11,9 +14,9 @@ impl Config {
     pub fn bootstrapper(self) -> Stage {
         Stage {
             _config: self,
+            ops_count: Default::default(),
             input: Default::default(),
             output: Default::default(),
-            ops_count: Default::default(),
         }
     }
 }
@@ -22,7 +25,6 @@ impl Config {
 #[stage(name = "enrich-skip", unit = "RawBlockPayload", worker = "Worker")]
 pub struct Stage {
     _config: Config,
-
     pub input: InputPort<RawBlockPayload>,
     pub output: OutputPort<EnrichedBlockPayload>,
 
@@ -52,30 +54,35 @@ impl gasket::framework::Worker<Stage> for Worker {
         stage: &mut Stage,
     ) -> Result<(), WorkerError> {
         match unit {
-            RawBlockPayload::RollForward(cbor) => {
-                stage
-                    .output
-                    .send(EnrichedBlockPayload::roll_forward(
+            RawBlockPayload::Forward(cbor) => stage
+                .output
+                .send(
+                    EnrichedBlockPayload::Forward(
                         cbor.clone(),
                         BlockContext::default(),
-                    ))
-                    .await
-                    .unwrap();
-            }
-            RawBlockPayload::RollBack(cbor, last_good_block_info_rollback) => {
-                stage
-                    .output
-                    .send(EnrichedBlockPayload::roll_back(
+                        Some((Point::new(0, Default::default()), 0)),
+                    )
+                    .into(),
+                )
+                .await
+                .map_err(|e| WorkerError::Send),
+            RawBlockPayload::Rollback(cbor, last_good_block_info_rollback) => stage
+                .output
+                .send(
+                    EnrichedBlockPayload::Rollback(
                         cbor.clone(),
                         BlockContext::default(),
-                        last_good_block_info_rollback.clone(),
-                    ))
-                    .await
-                    .unwrap();
-            }
-            RawBlockPayload::RollForwardGenesis => {}
-        };
-
-        Ok(())
+                        Some(last_good_block_info_rollback.clone()),
+                    )
+                    .into(),
+                )
+                .await
+                .map_err(|e| WorkerError::Send),
+            RawBlockPayload::Genesis => stage
+                .output
+                .send(EnrichedBlockPayload::Genesis(Default::default()).into())
+                .await
+                .map_err(|e| WorkerError::Send), // todo: send genesis?
+        }
     }
 }

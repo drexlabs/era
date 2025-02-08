@@ -15,19 +15,18 @@ enum Era {
 async fn main() {
     let args = Era::parse();
 
-    let result = match args {
-        Era::Daemon(x) => daemon::run(&x),
+    match args {
+        Era::Daemon(x) => match daemon::run(&x) {
+            Ok(tether) => {
+                tether.join_stage();
+            }
+
+            Err(err) => {
+                eprintln!("ERROR: {:#?}", err);
+                process::exit(1);
+            }
+        },
     };
 
-    if let Err(err) = &result {
-        eprintln!("ERROR: {:#?}", err);
-        process::exit(1);
-    } else {
-        // tood make loop cancelable. prob move to daemon, tbh
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
-
-        process::exit(0);
-    }
+    // todo: keyboard interrupt
 }

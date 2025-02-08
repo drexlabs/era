@@ -35,11 +35,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn bootstrapper(
-        self,
-        ctx: Arc<Mutex<pipeline::Context>>,
-        cursor: Cursor,
-    ) -> chainsync::Stage {
+    pub fn bootstrapper(self, ctx: Arc<pipeline::Context>, cursor: Cursor) -> chainsync::Stage {
         chainsync::Stage {
             config: self,
             ctx,

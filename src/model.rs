@@ -1,32 +1,136 @@
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 use std::{collections::HashMap, fmt::Debug};
 
 use std::convert::Into;
 
-use pallas::codec::minicbor;
+use gasket::runtime::Policy;
 use pallas::crypto::hash::Hash;
-use pallas::ledger::configs::byron::GenesisUtxo;
-use pallas::ledger::traverse::MultiEraPolicyAssets;
+use pallas::ledger::configs::byron::{from_file, GenesisUtxo};
 use pallas::{
     ledger::traverse::{Era, MultiEraBlock, MultiEraOutput, OutputRef},
     network::miniprotocols::Point,
 };
 
-use pallas_addresses::{Address, Error as AddressError};
-use pallas_primitives::babbage::MintedDatumOption;
+use serde::Deserialize;
 
-use crate::prelude::*;
+use crate::pipeline::Context;
+use crate::{crosscut, enrich, prelude::*, reducers, sources, storage};
+
+#[derive(Deserialize)]
+pub struct ConfigRoot {
+    pub source: Option<sources::Config>,
+    pub enrich: Option<enrich::Config>,
+    pub reducers: Option<reducers::worker::Config>,
+    pub storage: Option<storage::Config>,
+    pub intersect: Option<crosscut::IntersectConfig>,
+    pub finalize: Option<crosscut::FinalizeConfig>,
+    pub chain: Option<crosscut::ChainConfig>,
+    pub blocks: Option<crosscut::historic::BlockConfig>,
+    pub block_data_policy: Option<crosscut::policies::BlockDataPolicy>, // todo revisit this
+    pub genesis: Option<String>,
+    pub tick_timeout: Option<Duration>,
+    pub bootstrap_retry: Option<gasket::retries::Policy>,
+    pub work_retry: Option<gasket::retries::Policy>,
+    pub teardown_retry: Option<gasket::retries::Policy>,
+}
+
+impl ConfigRoot {
+    pub fn new(with_file: &Option<std::path::PathBuf>) -> Result<Self, config::ConfigError> {
+        let runtime_config = config::Config::builder();
+
+        match with_file.as_ref().and_then(|x| x.to_str()) {
+            Some(with_file) => {
+                runtime_config.add_source(config::File::with_name(with_file).required(true))
+            }
+
+            None => runtime_config
+                .add_source(config::File::with_name("/etc/era/config.toml").required(false))
+                .add_source(config::File::with_name("~/.local/era/config.toml").required(false))
+                .add_source(config::File::with_name("config.toml").required(false)),
+        }
+        .add_source(config::Environment::with_prefix("ERA").separator("_")) // consider making this configurable -- way later
+        .build()?
+        .try_deserialize()
+    }
+
+    pub fn take_gasket_policy(&mut self) -> Policy {
+        Policy {
+            tick_timeout: self.tick_timeout.take(),
+            bootstrap_retry: self.bootstrap_retry.take().unwrap_or_default(),
+            work_retry: self.work_retry.take().unwrap_or_default(),
+            teardown_retry: self.teardown_retry.take().unwrap_or_default(),
+        }
+    }
+
+    pub fn take_some_to_make_context(&mut self) -> Arc<Context> {
+        let chain = self.chain.take().unwrap_or_default();
+        let chaintag = match chain {
+            crosscut::ChainConfig::Mainnet => "mainnet",
+            crosscut::ChainConfig::Testnet => "testnet",
+            crosscut::ChainConfig::PreProd => "preprod",
+            crosscut::ChainConfig::Preview => "preview",
+            crosscut::ChainConfig::Custom(_) => "custom", // todo: look into this
+        };
+
+        let genesis_path = &self
+            .genesis
+            .take()
+            .unwrap_or(format!("assets/{}-byron-genesis.json", chaintag,));
+
+        log::info!("making context: with genesis ({})", genesis_path);
+
+        Arc::new(Context {
+            chain: chain.into(),
+            intersect: self.intersect.take(),
+            finalize: self.finalize.take(),
+            block_buffer: self.blocks.take().unwrap_or_default().into(),
+            genesis_file: from_file(Path::new(genesis_path)).unwrap(),
+        })
+    }
+}
+
+impl From<ConfigRoot> for Context {
+    fn from(config: ConfigRoot) -> Self {
+        let chain = config.chain.unwrap().into();
+        let chaintag = match chain {
+            crosscut::ChainConfig::Mainnet => "mainnet",
+            crosscut::ChainConfig::Testnet => "testnet",
+            crosscut::ChainConfig::PreProd => "preprod",
+            crosscut::ChainConfig::Preview => "preview",
+            crosscut::ChainConfig::Custom(_) => "custom", // todo: look into this
+        };
+
+        Self {
+            chain: chain.into(),
+            intersect: config.intersect.into(),
+            finalize: match config.finalize.unwrap().into() {
+                Some(finalize_config) => Some(finalize_config.into()),
+                None => None,
+            },
+            block_buffer: config.blocks.unwrap_or_default().into(),
+            genesis_file: from_file(Path::new(
+                &config
+                    .genesis
+                    .unwrap_or(format!("/etc/era/{}-byron-genesis.json", chaintag,)),
+            ))
+            .unwrap(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum RawBlockPayload {
-    RollForwardGenesis,
-    RollForward(Vec<u8>),
-    RollBack(Vec<u8>, (Point, u64)),
+    Genesis,
+    Forward(Vec<u8>),
+    Rollback(Vec<u8>, (Point, u64)),
 }
 
 impl RawBlockPayload {
     pub fn roll_forward(block: Vec<u8>) -> gasket::messaging::Message<Self> {
         gasket::messaging::Message {
-            payload: Self::RollForward(block),
+            payload: Self::Forward(block),
         }
     }
 
@@ -35,7 +139,7 @@ impl RawBlockPayload {
         last_good_block_info: (Point, u64),
     ) -> gasket::messaging::Message<Self> {
         gasket::messaging::Message {
-            payload: Self::RollBack(block, last_good_block_info),
+            payload: Self::Rollback(block, last_good_block_info),
         }
     }
 }
@@ -44,42 +148,6 @@ impl RawBlockPayload {
 pub struct BlockContext {
     utxos: HashMap<String, (Era, Vec<u8>)>,
     pub block_number: u64,
-}
-
-#[derive(Clone, Debug)]
-pub enum BlockOrigination<'b> {
-    Chain(MultiEraOutput<'b>),
-    Genesis(GenesisUtxo),
-}
-
-impl<'b> BlockOrigination<'b> {
-    pub fn address(&self) -> Result<Address, AddressError> {
-        match self {
-            BlockOrigination::Chain(output) => output.address(),
-            BlockOrigination::Genesis(genesis) => Ok(Address::Byron(genesis.1.clone())),
-        }
-    }
-
-    pub fn lovelace_amount(&self) -> u64 {
-        match self {
-            BlockOrigination::Chain(output) => output.lovelace_amount(),
-            BlockOrigination::Genesis(genesis) => genesis.2,
-        }
-    }
-
-    pub fn non_ada_assets(&'b self) -> Vec<MultiEraPolicyAssets<'b>> {
-        match self {
-            BlockOrigination::Chain(output) => output.non_ada_assets(),
-            BlockOrigination::Genesis(_) => vec![],
-        }
-    }
-
-    pub fn datum(&self) -> Option<MintedDatumOption> {
-        match self {
-            BlockOrigination::Chain(output) => output.datum(),
-            BlockOrigination::Genesis(_) => None,
-        }
-    }
 }
 
 impl BlockContext {
@@ -104,33 +172,73 @@ impl BlockContext {
     }
 }
 
-#[derive(Debug, Clone)]
+pub enum DecodedBlockAction<'a> {
+    Forward(MultiEraBlock<'a>, &'a BlockContext, Option<(Point, u64)>),
+    Genesis(Vec<GenesisUtxo>), // This one probably needs to stay owned
+    Rollback(MultiEraBlock<'a>, &'a BlockContext, Option<(Point, u64)>),
+}
+
+impl<'a> DecodedBlockAction<'a> {
+    pub fn is_rollback(&self) -> bool {
+        match self {
+            Self::Rollback(..) => true,
+            _ => false,
+        }
+    }
+}
+
+impl<'a> From<&'a EnrichedBlockPayload> for DecodedBlockAction<'a> {
+    fn from(enriched_block_payload: &'a EnrichedBlockPayload) -> Self {
+        let decoded = enriched_block_payload.decode_block();
+        match enriched_block_payload {
+            EnrichedBlockPayload::Forward(_, block_context, _) => {
+                DecodedBlockAction::Forward(decoded.unwrap(), block_context, None)
+            }
+            EnrichedBlockPayload::Genesis(genesis_utxo) => {
+                DecodedBlockAction::Genesis(genesis_utxo.clone()) // This clone might still be needed
+            }
+            EnrichedBlockPayload::Rollback(_, block_context, point) => {
+                DecodedBlockAction::Rollback(decoded.unwrap(), block_context, point.clone())
+            }
+        }
+    }
+}
+
+#[derive(Clone)] // unfortunate that clone needs to be allowed here, gasket clones messages :(
 pub enum EnrichedBlockPayload {
-    RollForward(Vec<u8>, BlockContext),
-    RollForwardGenesis(Vec<GenesisUtxo>),
-    RollBack(Vec<u8>, BlockContext, (Point, u64)),
+    Forward(Vec<u8>, BlockContext, Option<(Point, u64)>),
+    Genesis(Vec<GenesisUtxo>),
+    Rollback(Vec<u8>, BlockContext, Option<(Point, u64)>),
 }
 
 impl EnrichedBlockPayload {
-    pub fn roll_forward_genesis(utxos: Vec<GenesisUtxo>) -> gasket::messaging::Message<Self> {
+    pub fn genesis(self) -> gasket::messaging::Message<Self> {
+        gasket::messaging::Message { payload: self }
+    }
+
+    pub fn forward(block: Vec<u8>, ctx: BlockContext) -> gasket::messaging::Message<Self> {
         gasket::messaging::Message {
-            payload: Self::RollForwardGenesis(utxos),
+            payload: Self::Forward(block, ctx, None),
         }
     }
 
-    pub fn roll_forward(block: Vec<u8>, ctx: BlockContext) -> gasket::messaging::Message<Self> {
-        gasket::messaging::Message {
-            payload: Self::RollForward(block, ctx),
-        }
-    }
-
-    pub fn roll_back(
+    pub fn rollback(
         block: Vec<u8>,
         ctx: BlockContext,
-        last_good_block_info: (Point, u64),
+        last_good_block: (Point, u64),
     ) -> gasket::messaging::Message<Self> {
         gasket::messaging::Message {
-            payload: Self::RollBack(block, ctx, last_good_block_info),
+            payload: Self::Rollback(block, ctx, Some(last_good_block)),
+        }
+    }
+
+    pub fn decode_block(&self) -> Option<MultiEraBlock> {
+        match self {
+            Self::Forward(block, _, _) | Self::Rollback(block, _, _) => {
+                MultiEraBlock::decode(block).ok()
+            }
+
+            _ => None,
         }
     }
 }
@@ -186,14 +294,14 @@ pub enum CRDTCommand {
     HashSetMulti(Key, Vec<Member>, Vec<Value>),
     HashUnsetKey(Key, Member),
     UnsetKey(Key),
-    BlockFinished(Point, Option<Vec<u8>>, bool),
+    BlockFinished(Point, Vec<u8>, i64, u64, i64, bool),
     Noop,
 }
 
 impl CRDTCommand {
     pub fn block_starting(
-        block: Option<MultiEraBlock>,
-        genesis_hash: Option<Hash<32>>,
+        block: Option<&MultiEraBlock>,
+        genesis_hash: Option<&Hash<32>>,
     ) -> CRDTCommand {
         match (block, genesis_hash) {
             (Some(block), None) => {
@@ -370,10 +478,13 @@ impl CRDTCommand {
 
     pub fn block_finished(
         point: Point,
-        block_bytes: Option<Vec<u8>>,
-        rollback: bool,
+        block_bytes: Vec<u8>, // make this take pointer to parsed block
+        era: i64,
+        tx_len: u64,
+        block_number: i64,
+        is_rollback: bool,
     ) -> CRDTCommand {
         log::debug!("block finished {:?}", point);
-        CRDTCommand::BlockFinished(point, block_bytes, rollback)
+        CRDTCommand::BlockFinished(point, block_bytes, era, tx_len, block_number, is_rollback)
     }
 }

@@ -35,8 +35,8 @@ pub(crate) struct NaiveProvider {
 }
 
 impl NaiveProvider {
-    pub async fn new(ctx: Arc<Mutex<Context>>) -> Self {
-        let config = ctx.lock().await.chain.clone();
+    pub async fn new(ctx: Arc<Context>) -> Self {
+        let config = ctx.chain.clone();
 
         assert!(
             config.byron_epoch_length > 0,

@@ -1,0 +1,19 @@
+[Unit]
+Description=Era: Redis Chain State
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/redis-server /etc/redis/era-state.conf
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=redis-state
+LimitNOFILE=1080
+Restart=on-failure
+RestartSec=30s
+WorkingDirectory=/era-redis-state
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use gasket::framework::*;
 
-use gasket::messaging::tokio::{InputPort, OutputPort};
-
+use gasket::messaging::{InputPort, OutputPort};
 use pallas::ledger::configs::byron::{genesis_utxos, GenesisUtxo};
 
 use pallas::ledger::traverse::MultiEraOutput;
@@ -12,18 +11,16 @@ use pallas::{
     ledger::traverse::{Era, MultiEraBlock, MultiEraTx, OutputRef},
 };
 
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Deserialize;
 use sled::IVec;
-use tokio::sync::Mutex;
 
 use crate::pipeline::Context;
-use crate::prelude::AppliesPolicy;
-use crate::Error;
 use crate::{
     model::{self, BlockContext, EnrichedBlockPayload, RawBlockPayload},
-    pipeline,
+    pipeline, Error,
 };
+
+const DB_CACHE_BYTES: usize = 1073741824;
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
@@ -32,17 +29,11 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn bootstrapper(
-        mut self,
-        ctx: Arc<Mutex<pipeline::Context>>,
-        rollback_db_path: String,
-    ) -> Stage {
-        self.rollback_db_path = Some(rollback_db_path);
+    pub fn bootstrapper(mut self, ctx: Arc<pipeline::Context>) -> Stage {
+        self.rollback_db_path = Some(ctx.as_ref().block_buffer.config.rollback_db_path.clone());
 
         Stage {
             config: self,
-            input: Default::default(),
-            output: Default::default(),
             enrich_inserts: Default::default(),
             enrich_removes: Default::default(),
             enrich_matches: Default::default(),
@@ -50,6 +41,8 @@ impl Config {
             enrich_blocks: Default::default(),
             enrich_transactions: Default::default(),
             enrich_cancelled_empty_tx: Default::default(),
+            input: Default::default(),
+            output: Default::default(),
             ctx,
         }
     }
@@ -82,7 +75,7 @@ impl TryFrom<IVec> for SledTxValue {
 #[inline]
 fn fetch_referenced_utxo<'a>(
     db: &sled::Db,
-    utxo_ref: &OutputRef,
+    utxo_ref: OutputRef,
 ) -> Result<Option<(OutputRef, Era, Vec<u8>)>, crate::Error> {
     if let Some(ivec) = db
         .get(utxo_ref.to_string().as_bytes())
@@ -149,12 +142,12 @@ impl Worker {
         genesis_utxo: &GenesisUtxo,
         inserts: &gasket::metrics::Counter,
     ) -> Result<(), crate::Error> {
-        let address = pallas_primitives::byron::Address {
+        let address = pallas::ledger::primitives::byron::Address {
             payload: genesis_utxo.1.payload.clone(),
             crc: genesis_utxo.1.crc,
         };
 
-        let byron_output = pallas_primitives::byron::TxOut {
+        let byron_output = pallas::ledger::primitives::byron::TxOut {
             address,
             amount: genesis_utxo.2,
         };
@@ -211,7 +204,7 @@ impl Worker {
             .collect();
 
         let matches: Result<Vec<_>, crate::Error> = required
-            .par_iter()
+            .into_iter()
             .map(|utxo_ref| fetch_referenced_utxo(db, utxo_ref))
             .collect();
 
@@ -321,11 +314,14 @@ impl Worker {
 }
 
 #[derive(Stage)]
-#[stage(name = "enrich-sled", unit = "RawBlockPayload", worker = "Worker")]
+#[stage(
+    name = "enrich-sled",
+    unit = "RawBlockPayload",
+    worker = "Worker" // todo: should be fine
+)]
 pub struct Stage {
     pub config: Config,
-
-    pub ctx: Arc<Mutex<Context>>,
+    pub ctx: Arc<Context>,
 
     pub input: InputPort<RawBlockPayload>,
     pub output: OutputPort<EnrichedBlockPayload>,
@@ -369,14 +365,10 @@ impl gasket::framework::Worker<Stage> for Worker {
             )
             .cache_capacity(1073741824);
 
-        let sled = Worker {
+        Ok(Worker {
             enrich_db: Some(enrich_config.open().or_panic()?),
             rollback_db: Some(rollback_config.open().or_panic()?),
-        };
-
-        log::info!("sled: enrich databases opened");
-
-        Ok(sled)
+        })
     }
 
     async fn schedule(
@@ -395,8 +387,8 @@ impl gasket::framework::Worker<Stage> for Worker {
         match self.db_refs_all() {
             Ok(db_refs) => match db_refs {
                 Some((db, consumed_ring)) => match unit {
-                    model::RawBlockPayload::RollForwardGenesis => {
-                        let all = genesis_utxos(&stage.ctx.lock().await.genesis_file).clone();
+                    model::RawBlockPayload::Genesis => {
+                        let all = genesis_utxos(&stage.ctx.genesis_file).clone();
 
                         for utxo in all {
                             self.insert_genesis_utxo(&db, &utxo, &stage.enrich_inserts)
@@ -406,23 +398,24 @@ impl gasket::framework::Worker<Stage> for Worker {
 
                         stage
                             .output
-                            .send(model::EnrichedBlockPayload::roll_forward_genesis(
-                                genesis_utxos(&stage.ctx.lock().await.genesis_file),
-                            ))
+                            .send(
+                                EnrichedBlockPayload::Genesis(genesis_utxos(
+                                    &stage.ctx.genesis_file,
+                                ))
+                                .into(),
+                            )
                             .await
                             .or_panic()?;
 
                         Ok(())
                     }
 
-                    model::RawBlockPayload::RollForward(cbor) => {
+                    model::RawBlockPayload::Forward(cbor) => {
                         let block = MultiEraBlock::decode(&cbor)
                             .map_err(crate::Error::cbor)
                             .or_panic()?;
 
                         let txs = block.txs();
-
-                        let mut generated_ctx = None;
 
                         let (ctx, match_count, mismatch_count) =
                             self.par_fetch_referenced_utxos(db, block.number(), &txs);
@@ -436,7 +429,7 @@ impl gasket::framework::Worker<Stage> for Worker {
                         stage.enrich_removes.inc(removed_count);
 
                         stage.enrich_blocks.inc(1);
-                        generated_ctx = Some(ctx);
+                        let generated_ctx = Some(ctx);
 
                         self.insert_produced_utxos(db, &txs, &stage.enrich_inserts)
                             .map_err(crate::Error::storage)
@@ -444,15 +437,19 @@ impl gasket::framework::Worker<Stage> for Worker {
 
                         stage
                             .output
-                            .send(model::EnrichedBlockPayload::roll_forward(
-                                cbor.clone(),
-                                generated_ctx.unwrap_or_default(),
-                            ))
+                            .send(
+                                model::EnrichedBlockPayload::Forward(
+                                    cbor.clone(),
+                                    generated_ctx.unwrap_or_default(),
+                                    None,
+                                )
+                                .into(),
+                            )
                             .await
                             .or_panic()
                     }
 
-                    model::RawBlockPayload::RollBack(
+                    model::RawBlockPayload::Rollback(
                         cbor,
                         (last_known_point, last_known_block_number),
                     ) => {
@@ -483,7 +480,7 @@ impl gasket::framework::Worker<Stage> for Worker {
 
                             stage
                                 .output
-                                .send(model::EnrichedBlockPayload::roll_back(
+                                .send(model::EnrichedBlockPayload::rollback(
                                     cbor.clone(),
                                     ctx,
                                     (last_known_point.clone(), last_known_block_number.clone()),

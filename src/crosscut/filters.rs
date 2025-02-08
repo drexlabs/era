@@ -132,7 +132,7 @@ fn eval_input_address(
     tx: &MultiEraTx,
     ctx: &model::BlockContext,
     pattern: &AddressPattern,
-    policy: &crosscut::policies::RuntimePolicy,
+    policy: &crosscut::policies::BlockDataPolicy,
 ) -> Result<bool, crate::Error> {
     for input in tx.inputs() {
         let utxo = ctx.find_utxo(&input.output_ref()).apply_policy(policy)?;
@@ -153,7 +153,7 @@ fn eval_collateral_address(
     tx: &MultiEraTx,
     ctx: &model::BlockContext,
     pattern: &AddressPattern,
-    policy: &crosscut::policies::RuntimePolicy,
+    policy: &crosscut::policies::BlockDataPolicy,
 ) -> Result<bool, crate::Error> {
     for input in tx.collateral() {
         let utxo = ctx.find_utxo(&input.output_ref()).apply_policy(policy)?;
@@ -188,7 +188,7 @@ fn eval_address(
     tx: &MultiEraTx,
     ctx: &model::BlockContext,
     pattern: &AddressPattern,
-    policy: &crosscut::policies::RuntimePolicy,
+    policy: &crosscut::policies::BlockDataPolicy,
 ) -> Result<bool, crate::Error> {
     if eval_output_address(tx, pattern)? {
         return Ok(true);
@@ -235,7 +235,7 @@ fn eval_any_of(
     block: &MultiEraBlock,
     tx: &MultiEraTx,
     ctx: &model::BlockContext,
-    policy: &crosscut::policies::RuntimePolicy,
+    policy: &crosscut::policies::BlockDataPolicy,
 ) -> Result<bool, crate::Error> {
     for p in predicates.iter() {
         if eval_predicate(p, block, tx, ctx, policy)? {
@@ -252,7 +252,7 @@ fn eval_all_of(
     block: &MultiEraBlock,
     tx: &MultiEraTx,
     ctx: &model::BlockContext,
-    policy: &crosscut::policies::RuntimePolicy,
+    policy: &crosscut::policies::BlockDataPolicy,
 ) -> Result<bool, crate::Error> {
     for p in predicates.iter() {
         if !eval_predicate(p, block, tx, ctx, policy)? {
@@ -268,7 +268,7 @@ pub fn eval_predicate(
     block: &MultiEraBlock,
     tx: &MultiEraTx,
     ctx: &model::BlockContext,
-    policy: &crosscut::policies::RuntimePolicy,
+    policy: &crosscut::policies::BlockDataPolicy,
 ) -> Result<bool, crate::Error> {
     match predicate {
         Predicate::Not(x) => eval_predicate(x, block, tx, ctx, policy).map(|x| !x),
@@ -297,7 +297,7 @@ mod tests {
         let bytes = hex::decode(cbor).unwrap();
         let block = MultiEraBlock::decode(&bytes).unwrap();
         let ctx = BlockContext::default();
-        let policy: crosscut::policies::RuntimePolicy = Default::default();
+        let policy: crosscut::policies::BlockDataPolicy = Default::default();
 
         let idxs: Vec<_> = block
             .txs()

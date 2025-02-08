@@ -1,6 +1,7 @@
 [Unit]
 Description=Era: Blockchain Indexer
-After=multi-user.target
+Requires=redis-blocks.service redis-state.service
+After=redis-blocks.service redis-state.service
 
 [Service]
 Type=simple
