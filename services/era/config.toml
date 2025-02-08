@@ -7,7 +7,7 @@ dismissible = false
 
 [source]
 type = "N2N"
-address = "relays-new.cardano-mainnet.iohk.io:3001"
+address = "backbone.mainnet.cardanofoundation.org:3001"
 min_depth = 10
 
 # [source]
@@ -28,23 +28,23 @@ type = "Redis"
 connection_params = "redis://127.0.0.1:6379/0"
 cursor_key = "_cursor"
 
-# [[reducers]]
-# type = "Utxo"
-# key_prefix = "tx"
-# coin_key_prefix = "c"
-# datum_key_prefix = "d"
+[[reducers]]
+type = "Utxo"
+key_prefix = "tx"
+coin_key_prefix = "c"
+datum_key_prefix = "d"
 
-# [[reducers]]
-# type = "Metadata"
-# projection = "Json"
-# key_prefix = "m"
-# royalty_key_prefix = "m.r"
+[[reducers]]
+type = "Metadata"
+projection = "Json"
+key_prefix = "m"
+royalty_key_prefix = "m.r"
 
 [[reducers]]
 type = "AssetsBalances"
 
 # [[reducers]]
-# type = "Handles"
+# type = "Handle"
 # key_prefix = "h"
 # policy_id = "f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a"
 

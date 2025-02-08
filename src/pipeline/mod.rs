@@ -46,8 +46,8 @@ impl std::convert::From<&str> for StageTypes {
 #[derive(Stage)]
 #[stage(name = "pipeline-bootstrapper", unit = "()", worker = "Pipeline")]
 pub struct Stage {
-    config: RefCell<ConfigRoot>,
-    args_console: Arc<console::Mode>,
+    pub config: RefCell<ConfigRoot>,
+    pub args_console: Arc<console::Mode>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -60,7 +60,7 @@ impl gasket::framework::Worker<Stage> for Pipeline {
         console::refresh(stage.args_console.as_ref(), None).await?;
 
         let mut pipe = Self {
-            policy: config.take_gasket_policy(),
+            policy: config.gasket_policy(),
             tethers: Default::default(),
             chain_config: Arc::new(config.chain.take().unwrap_or_default()),
             ctx: config.take_some_to_make_context(),
@@ -124,20 +124,19 @@ impl gasket::framework::Worker<Stage> for Pipeline {
 
         let mut tether_error = false;
 
-        log::warn!("pipeline: spawning tethers");
+        log::info!("pipeline: spawning tethers");
 
         loop {
             console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
 
             let mut bootstrapping_consumers = false;
             for tether in &pipe.tethers {
-                console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
                 match tether.check_state() {
                     TetherState::Blocked(_) => {
                         bootstrapping_consumers = true;
                     }
                     TetherState::Dropped => {
-                        log::warn!("pipeline: dropped tether {}", tether.name());
+                        log::info!("pipeline: dropped tether {}", tether.name());
                         tether_error = true;
                         break;
                     }
@@ -146,11 +145,11 @@ impl gasket::framework::Worker<Stage> for Pipeline {
                             bootstrapping_consumers = true;
                         }
                         StagePhase::Teardown => {
-                            log::warn!("pipeline: tore down {}", tether.name());
+                            log::info!("pipeline: tore down {}", tether.name());
                             tether_error = true;
                         }
                         StagePhase::Ended => {
-                            log::warn!("pipeline: ended {}", tether.name());
+                            log::info!("pipeline: ended {}", tether.name());
                             tether_error = true;
                         }
                         StagePhase::Working => {
@@ -158,10 +157,11 @@ impl gasket::framework::Worker<Stage> for Pipeline {
                         }
                     },
                 }
+                console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
             }
 
             if tether_error {
-                log::warn!("pipeline: tether startup error");
+                log::info!("pipeline: tether startup error");
                 return Err(WorkerError::Panic);
             }
 
@@ -173,11 +173,11 @@ impl gasket::framework::Worker<Stage> for Pipeline {
         pipe.tethers
             .push(enrich_stage.spawn_stage(pipe.policy.clone()));
 
-        log::warn!("pipeline: reached data source tether");
+        log::info!("pipeline: reached data source tether");
         pipe.tethers
             .push(source_stage.spawn_stage(pipe.policy.clone()));
 
-        log::warn!("pipeline: all tethers are alive");
+        log::info!("pipeline: all tethers are alive");
 
         return Ok(pipe);
     }

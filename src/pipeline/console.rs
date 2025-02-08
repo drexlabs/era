@@ -6,7 +6,7 @@ use gasket::{
     runtime::{StagePhase, TetherState},
 };
 use lazy_static::lazy_static;
-use log::Log;
+use log::{warn, Log};
 use ratatui::prelude::Layout;
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Padding};
 use std::ops::{Deref, DerefMut};
@@ -339,6 +339,7 @@ impl BlockGraph {
                 0.0
             };
 
+            warn!("comparing values {} {}", current_value, previous_value);
             let value_diff = current_value - previous_value;
 
             let rate_of_increase = if time_diff > 0.0 && value_diff > 0 {
@@ -1260,13 +1261,10 @@ pub async fn initialize(mode: &Mode) {
         .unwrap();
 }
 
+// note: this is what gets repeatedly called for redraws.. its gross.. want to make this more direct
 pub async fn refresh(mode: &Mode, pipeline: Option<&super::Pipeline>) -> Result<(), WorkerError> {
-    let mode = match mode {
+    match mode {
         Mode::TUI => TUI_CONSOLE.lock().await.refresh(pipeline).await,
         _ => PLAIN_CONSOLE.refresh(pipeline),
-    };
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-
-    mode
+    }
 }

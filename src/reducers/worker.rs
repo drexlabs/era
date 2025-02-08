@@ -1,5 +1,6 @@
 use futures::future::join_all;
 use gasket::runtime::{Policy, Tether};
+use log::warn;
 use std::sync::Arc;
 
 use async_trait;
@@ -155,7 +156,10 @@ impl gasket::framework::Worker<Stage> for Worker {
                             .await
                             .into_iter()
                             .collect::<Result<Vec<_>, _>>()
-                            .map_err(|_| WorkerError::Panic)?;
+                            .map_err(|e| {
+                                warn!("the big one {:?}", e);
+                                WorkerError::Panic
+                            })?;
 
                         stage
                             .output

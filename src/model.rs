@@ -55,12 +55,12 @@ impl ConfigRoot {
         .try_deserialize()
     }
 
-    pub fn take_gasket_policy(&mut self) -> Policy {
+    pub fn gasket_policy(&self) -> Policy {
         Policy {
-            tick_timeout: self.tick_timeout.take(),
-            bootstrap_retry: self.bootstrap_retry.take().unwrap_or_default(),
-            work_retry: self.work_retry.take().unwrap_or_default(),
-            teardown_retry: self.teardown_retry.take().unwrap_or_default(),
+            tick_timeout: self.tick_timeout,
+            bootstrap_retry: self.bootstrap_retry.clone().unwrap_or_default(),
+            work_retry: self.work_retry.clone().unwrap_or_default(),
+            teardown_retry: self.teardown_retry.clone().unwrap_or_default(),
         }
     }
 
