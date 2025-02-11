@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use futures::lock::Mutex;
 use gasket::messaging::OutputPort;
 use pallas::ledger::addresses::{Address, StakeAddress};
 use serde::Deserialize;
@@ -26,8 +25,7 @@ impl Default for Config {
 
 pub struct Reducer {
     config: Config,
-    ctx: Arc<Context>,
-    output: OutputPort<CRDTCommand>,
+    pub output: OutputPort<CRDTCommand>,
 }
 
 impl Reducer {
@@ -49,7 +47,7 @@ impl Reducer {
                             if let Ok(txo) = c.find_utxo(&input.output_ref()) {
                                 let mut asset_names: Vec<String> = vec![];
 
-                                for asset_list in txo.non_ada_assets() {
+                                for asset_list in txo.value().assets() {
                                     for asset in asset_list.assets() {
                                         asset_names.push(hex::encode(asset.name()).to_string())
                                     }
@@ -119,13 +117,13 @@ impl Reducer {
                         for (_, txo) in tx.produces() {
                             let mut asset_names: Vec<String> = vec![];
 
-                            for asset_list in txo.non_ada_assets() {
+                            for asset_list in txo.value().assets() {
                                 for asset in asset_list.assets() {
                                     match String::from_utf8(asset.name().to_vec()) {
                                         Ok(asset_name) => asset_names.push(asset_name),
                                         Err(_) => log::warn!(
-                                            "could not parse asset name {} not a valid ada handle?",
-                                            ""
+                                            "could not parse asset name {:?} not a valid ada handle?",
+                                            asset.name().to_ascii_lowercase(),
                                         ),
                                     };
                                 }
@@ -199,14 +197,13 @@ impl Reducer {
 }
 
 impl Config {
-    pub fn plugin(self, ctx: Arc<Context>) -> super::Reducer {
+    pub fn plugin(self) -> super::Reducer {
         let reducer = Reducer {
             config: Self {
                 key_prefix: self.key_prefix,
                 policy_id: self.policy_id,
             },
             output: Default::default(),
-            ctx,
         };
         super::Reducer::Handle(reducer)
     }

@@ -3,7 +3,7 @@ use crossbeam_queue::SegQueue;
 use pallas::network::miniprotocols::Point;
 use serde::{Deserialize, Serialize};
 use sled::IVec;
-use std::{fs::create_dir_all, mem};
+use std::fs::create_dir_all;
 
 const DISK_COMPRESSION_FACTOR: i32 = 20;
 const SYSTEM_PAGE_CACHE_BYTES: u64 = 1073741824;

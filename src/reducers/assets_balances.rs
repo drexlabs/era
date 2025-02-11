@@ -47,7 +47,7 @@ pub struct Config {
 pub struct Reducer {
     config: Config,
     ctx: Arc<Context>,
-    output: OutputPort<CRDTCommand>,
+    pub output: OutputPort<CRDTCommand>,
 }
 
 impl Reducer {
@@ -95,7 +95,7 @@ impl Reducer {
                             };
 
                             *fingerprint_tallies
-                                .entry(address.clone().to_string())
+                                .entry(address.to_string())
                                 .or_insert(HashMap::new())
                                 .entry(fingerprint.clone())
                                 .or_insert(0_i64) += adjusted_quantity;

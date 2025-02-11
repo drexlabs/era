@@ -1,17 +1,12 @@
-use futures::lock::Mutex;
-use futures::TryFutureExt;
 use gasket::messaging::OutputPort;
+use log::warn;
 use pallas::crypto::hash::Hash;
 use pallas::ledger::addresses::{Address, StakeAddress};
-use pallas::ledger::configs::byron::GenesisUtxo;
-use pallas::ledger::traverse::{MultiEraAsset, MultiEraBlock, MultiEraOutput, OutputRef};
+use pallas::ledger::traverse::{MultiEraAsset, MultiEraOutput, OutputRef};
 use pallas_bech32::cip14::AssetFingerprint;
-use serde::{Deserialize, Deserializer, Serialize};
-use std::borrow::BorrowMut;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
-use crate::model::{BlockContext, CRDTCommand, DecodedBlockAction};
-use crate::pipeline::Context;
+use crate::model::{CRDTCommand, DecodedBlockAction};
 use crate::{model, prelude::*};
 
 const ERROR_MSG: &str = "could not send gasket message from utxo reducer";
@@ -34,9 +29,8 @@ impl Default for Config {
 }
 
 pub struct Reducer {
-    config: Config,
-    ctx: Arc<Context>,
-    output: OutputPort<CRDTCommand>,
+    pub config: Config,
+    pub output: OutputPort<CRDTCommand>,
 }
 
 // hash and index are stored in the key
@@ -67,25 +61,25 @@ impl Reducer {
     }
 
     async fn tx_state(&mut self, soa: &str, tx_str: &str, should_exist: bool) -> Result<(), Error> {
-        self.output
-            .send(
-                match should_exist {
-                    true => CRDTCommand::set_add(
-                        self.config.key_prefix.clone().as_deref(),
-                        &soa,
-                        tx_str.to_string(),
-                    ),
+        let msg = match should_exist {
+            true => CRDTCommand::set_add(
+                self.config.key_prefix.clone().as_deref(),
+                &soa,
+                tx_str.to_string(),
+            ),
 
-                    false => CRDTCommand::set_remove(
-                        self.config.key_prefix.clone().as_deref(),
-                        &soa,
-                        tx_str.to_string(),
-                    ),
-                }
-                .into(),
-            )
+            false => CRDTCommand::set_remove(
+                self.config.key_prefix.clone().as_deref(),
+                &soa,
+                tx_str.to_string(),
+            ),
+        };
+
+        self.output
+            .send(msg.into())
             .await
-            .map_err(|_| Error::message(ERROR_MSG))
+            .or_retry()
+            .map_err(|a| Error::message(ERROR_MSG))
     }
 
     async fn coin_state(
@@ -113,6 +107,7 @@ impl Reducer {
                 .into(),
             )
             .await
+            .or_retry()
             .map_err(|_| Error::message(ERROR_MSG))
     }
 
@@ -143,6 +138,7 @@ impl Reducer {
                 .into(),
             )
             .await
+            .or_retry()
             .map_err(|_| Error::message(ERROR_MSG))
     }
 
@@ -180,6 +176,7 @@ impl Reducer {
                 .output
                 .send(output.into())
                 .await
+                .or_retry()
                 .map_err(|_| Error::message(ERROR_MSG));
         } else {
             return Ok(());
@@ -196,9 +193,10 @@ impl Reducer {
 
         let address = utxo.address().map(|x| x.to_string()).unwrap();
 
-        let lovelace_amt = utxo.lovelace_amount();
+        let lovelace_amt = utxo.value().coin();
         let cloned_utxo = utxo.clone();
-        let non_ada_assets = cloned_utxo.non_ada_assets();
+        let cloned_utxo_value = cloned_utxo.value();
+        let non_ada_assets = cloned_utxo_value.assets();
 
         if let Ok(raw_address) = utxo.address() {
             let soa = self.stake_or_address_from_address(&raw_address);
@@ -272,7 +270,7 @@ impl Reducer {
             self.coin_state(
                 &tx_address,
                 &format!("{}#{}", tx_hash, output_idx),
-                tx_output.lovelace_amount().to_string().as_str(),
+                tx_output.value().coin().to_string().as_str(),
                 !rollback,
             )
             .await?;
@@ -285,7 +283,7 @@ impl Reducer {
             )
             .await?;
 
-            for asset_group in tx_output.non_ada_assets() {
+            for asset_group in tx_output.value().assets() {
                 for asset in asset_group.assets() {
                     if let MultiEraAsset::AlonzoCompatibleOutput(policy_id, asset_name, quantity) =
                         asset
@@ -334,9 +332,13 @@ impl Reducer {
                     let address = hex::encode(utxo.1.to_vec());
                     let key = format!("{}#{}", hex::encode(utxo.0), 0);
 
+                    //warn!("gonna do tx state");
+
                     self.tx_state(&address, &key, true).await?;
 
-                    self.coin_state(&address, &key, &utxo.2.to_string(), false)
+                    // warn!("gonna do coin state");
+
+                    self.coin_state(&address, &key, utxo.2.to_string().as_str(), false)
                         .await?
                 }
 
@@ -371,10 +373,9 @@ impl Reducer {
 }
 
 impl Config {
-    pub fn plugin(self, ctx: Arc<Context>) -> super::Reducer {
+    pub fn plugin(self) -> super::Reducer {
         super::Reducer::Utxo(Reducer {
             config: self,
-            ctx,
             output: Default::default(),
         })
     }

@@ -4,13 +4,8 @@ use crate::crosscut::epochs::block_epoch;
 use crate::model::{CRDTCommand, DecodedBlockAction, Value};
 use crate::pipeline::Context;
 use crate::{model, Error};
-use futures::lock::Mutex;
 use gasket::messaging::OutputPort;
-use pallas::ledger::configs::byron::GenesisUtxo;
-use pallas::ledger::traverse::MultiEraBlock;
 use serde::Deserialize;
-
-const ERROR_MSG: &str = "could not send gasket message from parameter reducer";
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -20,7 +15,7 @@ pub struct Config {
 pub struct Reducer {
     config: Config,
     ctx: Arc<Context>,
-    output: OutputPort<CRDTCommand>,
+    pub output: OutputPort<CRDTCommand>,
 }
 
 impl Reducer {
@@ -46,7 +41,7 @@ impl Reducer {
             // todo: no genesis support
             DecodedBlockAction::Rollback(..) => Ok(()),
 
-            DecodedBlockAction::Forward(block, _, point) => {
+            DecodedBlockAction::Forward(block, _, _) => {
                 let mut member_keys = vec![
                     "epoch_no".into(),
                     "height".into(),

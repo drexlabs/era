@@ -60,29 +60,35 @@ impl gasket::framework::Worker<Stage> for Worker {
                     EnrichedBlockPayload::Forward(
                         cbor.clone(),
                         BlockContext::default(),
-                        Some((Point::new(0, Default::default()), 0)),
+                        Some(Point::new(0, Default::default())),
                     )
                     .into(),
                 )
                 .await
-                .map_err(|e| WorkerError::Send),
-            RawBlockPayload::Rollback(cbor, last_good_block_info_rollback) => stage
-                .output
-                .send(
-                    EnrichedBlockPayload::Rollback(
-                        cbor.clone(),
-                        BlockContext::default(),
-                        Some(last_good_block_info_rollback.clone()),
-                    )
-                    .into(),
-                )
-                .await
-                .map_err(|e| WorkerError::Send),
+                .map_err(|_| WorkerError::Send),
+            RawBlockPayload::Rollback(blocks) => {
+                for block in blocks {
+                    stage
+                        .output
+                        .send(
+                            EnrichedBlockPayload::Rollback(
+                                block.clone(),
+                                BlockContext::default(),
+                                None,
+                            )
+                            .into(),
+                        )
+                        .await
+                        .map_err(|_| WorkerError::Send)?;
+                }
+
+                Ok(())
+            }
             RawBlockPayload::Genesis => stage
                 .output
                 .send(EnrichedBlockPayload::Genesis(Default::default()).into())
                 .await
-                .map_err(|e| WorkerError::Send), // todo: send genesis?
+                .map_err(|_| WorkerError::Send), // todo: send genesis?
         }
     }
 }

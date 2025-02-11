@@ -9,11 +9,7 @@ use gasket::{
 };
 use serde::Deserialize;
 
-use crate::{
-    crosscut::PointArg,
-    model,
-    pipeline::{self, Context},
-};
+use crate::{crosscut::PointArg, model, pipeline::Context};
 
 #[derive(Deserialize, Clone)]
 #[serde(tag = "type")]

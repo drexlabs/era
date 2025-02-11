@@ -1,4 +1,5 @@
 use clap::Parser;
+use log::warn;
 use std::process;
 
 mod daemon;
@@ -17,16 +18,17 @@ async fn main() {
 
     match args {
         Era::Daemon(x) => match daemon::run(&x) {
-            Ok(tether) => {
-                tether.join_stage();
+            Ok(pipeline_tether) => {
+                pipeline_tether.join_stage();
             }
 
             Err(err) => {
-                eprintln!("ERROR: {:#?}", err);
                 process::exit(1);
             }
         },
     };
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100000)).await;
 
     // todo: keyboard interrupt
 }

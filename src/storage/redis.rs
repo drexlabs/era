@@ -4,6 +4,7 @@ use std::sync::Arc;
 use gasket::framework::*;
 
 use gasket::messaging::InputPort;
+use log::warn;
 use redis::{Cmd, Commands, ConnectionLike, ToRedisArgs};
 use serde::Deserialize;
 
@@ -128,7 +129,7 @@ pub fn string_to_i64(s: String) -> i64 {
 #[async_trait::async_trait(?Send)]
 impl gasket::framework::Worker<Stage> for Worker {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
-        log::debug!("connecting to redis");
+        log::info!("connecting to redis");
         Ok(Self {
             connection: Some(
                 redis::Client::open(stage.config.connection_params.clone())
@@ -142,8 +143,12 @@ impl gasket::framework::Worker<Stage> for Worker {
         &mut self,
         stage: &mut Stage,
     ) -> Result<WorkSchedule<CRDTCommand>, WorkerError> {
-        let msg = stage.input.recv().await.or_retry()?;
-        Ok(WorkSchedule::Unit(msg.payload))
+        stage
+            .input
+            .recv()
+            .await
+            .or_retry()
+            .map(|msg| WorkSchedule::Unit(msg.payload))
     }
 
     async fn execute(&mut self, unit: &CRDTCommand, stage: &mut Stage) -> Result<(), WorkerError> {
@@ -151,115 +156,79 @@ impl gasket::framework::Worker<Stage> for Worker {
 
         match unit {
             CRDTCommand::Noop => Ok(()),
-            model::CRDTCommand::BlockStarting(_) => {
-                // start redis transaction
-                redis::cmd("MULTI")
-                    .query(self.connection.as_mut().unwrap())
-                    .or_retry()
-            }
+            model::CRDTCommand::BlockStarting(_) => redis::cmd("MULTI")
+                .query(self.connection.as_mut().unwrap())
+                .or_retry(),
+
             CRDTCommand::GrowOnlySetAdd(key, member) => self
                 .connection
                 .as_mut()
                 .unwrap()
                 .sadd(key, member)
                 .or_retry(),
-            CRDTCommand::SetAdd(key, member) => {
-                log::debug!("adding to set [{}], value [{}]", key, member);
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .sadd(key, member)
-                    .or_retry()
-            }
-            CRDTCommand::SetRemove(key, member) => {
-                log::debug!("removing from set [{}], value [{}]", key, member);
+            CRDTCommand::SetAdd(key, member) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .sadd(key, member)
+                .or_retry(),
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .srem(key, member)
-                    .or_retry()
-            }
-            CRDTCommand::LastWriteWins(key, member, ts) => {
-                log::debug!("last write for [{}], slot [{}]", key, ts);
+            CRDTCommand::SetRemove(key, member) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .srem(key, member)
+                .or_retry(),
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .zadd(key, member, ts)
-                    .or_retry()
-            }
-            CRDTCommand::SortedSetAdd(key, member, delta) => {
-                log::debug!(
-                    "sorted set add [{}], value [{}], delta [{}]",
-                    key,
-                    member,
-                    delta
-                );
+            CRDTCommand::LastWriteWins(key, member, ts) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .zadd(key, member, ts)
+                .or_retry(),
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .zincr(key, member, delta)
-                    .or_retry()
-            }
-            CRDTCommand::SortedSetMemberRemove(key, member) => {
-                log::debug!("sorted set member remove [{}], value [{}]", key, member);
+            CRDTCommand::SortedSetAdd(key, member, delta) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .zincr(key, member, delta)
+                .or_retry(),
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .zrem(&key, member)
-                    .or_retry()
-            }
-            CRDTCommand::SortedSetRemove(key, member, delta) => {
-                log::debug!(
-                    "sorted set member with score remove [{}], value [{}], delta [{}]",
-                    key,
-                    member,
-                    delta
-                );
+            CRDTCommand::SortedSetMemberRemove(key, member) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .zrem(&key, member)
+                .or_retry(),
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .zrembyscore(&key, member, delta)
-                    .or_retry()
-            }
-            CRDTCommand::Spoil(key) => {
-                log::debug!("overwrite [{}]", key);
+            CRDTCommand::SortedSetRemove(key, member, delta) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .zrembyscore(&key, member, delta)
+                .or_retry(),
 
-                self.connection.as_mut().unwrap().del(key).or_retry()
-            }
+            CRDTCommand::Spoil(key) => self.connection.as_mut().unwrap().del(key).or_retry(),
+
             CRDTCommand::AnyWriteWins(key, value) => {
-                log::debug!("overwrite [{}]", key);
-
                 self.connection.as_mut().unwrap().set(key, value).or_retry()
             }
-            CRDTCommand::PNCounter(key, delta) => {
-                log::debug!("increasing counter [{}], by [{}]", key, delta);
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .req_command(
-                        &Cmd::new()
-                            .arg("INCRBYFLOAT")
-                            .arg(key)
-                            .arg(delta.to_string()),
-                    )
-                    .and_then(|_| Ok(()))
-                    .or_retry()
-            }
+            CRDTCommand::PNCounter(key, delta) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .req_command(
+                    &Cmd::new()
+                        .arg("INCRBYFLOAT")
+                        .arg(key)
+                        .arg(delta.to_string()),
+                )
+                .and_then(|_| Ok(()))
+                .or_retry(),
+
             CRDTCommand::HashSetMulti(key, members, values) => {
-                log::debug!(
-                    "setting hash multi on key {} for {} members and {} values",
-                    key,
-                    members.len(),
-                    values.len()
-                );
-
                 let mut tuples: Vec<(Member, Value)> = vec![];
                 for (index, member) in members.iter().enumerate() {
                     tuples.push((member.to_owned(), values[index].clone()));
@@ -271,84 +240,81 @@ impl gasket::framework::Worker<Stage> for Worker {
                     .hset_multiple(key, &tuples)
                     .or_retry()
             }
-            CRDTCommand::HashSetValue(key, member, value) => {
-                log::debug!("setting hash key {} member {}", key, member);
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .hset(key, member, value)
-                    .or_retry()
-            }
-            CRDTCommand::HashCounter(key, member, delta) => {
-                log::debug!(
-                    "increasing hash key {} member {} by {}",
-                    key.clone(),
-                    member.clone(),
-                    delta
-                );
+            CRDTCommand::HashSetValue(key, member, value) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .hset(key, member, value)
+                .or_retry(),
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .req_command(
-                        &Cmd::new()
-                            .arg("HINCRBYFLOAT")
-                            .arg(key.clone())
-                            .arg(member.clone())
-                            .arg(delta.to_string()),
-                    )
-                    .and_then(|_| Ok(()))
-                    .or_retry()
-            }
-            CRDTCommand::HashUnsetKey(key, member) => {
-                log::debug!("deleting hash key {} member {}", key, member);
+            CRDTCommand::HashCounter(key, member, delta) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .req_command(
+                    &Cmd::new()
+                        .arg("HINCRBYFLOAT")
+                        .arg(key.clone())
+                        .arg(member.clone())
+                        .arg(delta.to_string()),
+                )
+                .and_then(|_| Ok(()))
+                .or_retry(),
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .hdel(member, key)
-                    .or_retry()
-            }
-            CRDTCommand::UnsetKey(key) => {
-                log::debug!("deleting key {}", key);
+            CRDTCommand::HashUnsetKey(key, member) => self
+                .connection
+                .as_mut()
+                .unwrap()
+                .hdel(member, key)
+                .or_retry(),
 
-                self.connection.as_mut().unwrap().del(key).or_restart()
-            }
-            CRDTCommand::BlockFinished(point, bytes, era, tx_len, block_number, rollback) => {
+            CRDTCommand::UnsetKey(key) => self.connection.as_mut().unwrap().del(key).or_retry(),
+
+            CRDTCommand::BlockFinished(
+                point,
+                bytes,
+                era,
+                tx_len,
+                block_number,
+                rollback,
+                is_genesis,
+            ) => {
                 let cursor_str = crosscut::PointArg::from(point.clone()).to_string();
                 stage.chain_era.set(era.clone());
 
-                self.connection
-                    .as_mut()
-                    .unwrap()
+                let connection = self.connection.as_mut().unwrap();
+                connection
                     .set(stage.config.cursor_key(), &cursor_str)
-                    .or_retry()?;
+                    .or_panic()?;
 
-                // end redis transaction
-                redis::cmd("EXEC")
-                    .query(self.connection.as_mut().unwrap())
-                    .or_retry()?;
+                if let Some(bytes) = bytes {
+                    if !bytes.is_empty() {
+                        stage
+                            .ctx
+                            .block_buffer
+                            .insert_block(&point, bytes)
+                            .or_panic()?; // if this panics, then state is probably in the unrecoverable place from here on out
+                    }
+                }
+
+                redis::cmd("EXEC").query(connection).or_retry()?;
+
+                warn!("donzeo");
 
                 stage.blocks_processed.inc(1);
+
+                if *is_genesis {
+                    warn!("[redis] byron genesis transactions indexed");
+                }
 
                 stage.transactions_finalized.inc(tx_len.clone());
                 stage.last_block.set(block_number.clone());
 
-                if *rollback {
-                    stage.ctx.block_buffer.remove_block(&point);
-                }
-
-                stage.ctx.block_buffer.insert_block(&point, bytes);
-
-                log::info!(
-                    "rolled {} to {}",
-                    match rollback {
-                        true => "backward",
-                        false => "forward",
-                    },
-                    cursor_str
-                );
+                // i dont think i need this because of my pop routine
+                // if *rollback {
+                //     stage.ctx.block_buffer.remove_block(&point).or_panic()?;
+                // }
 
                 Ok(())
             }

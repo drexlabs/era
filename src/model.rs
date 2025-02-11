@@ -5,7 +5,8 @@ use std::{collections::HashMap, fmt::Debug};
 
 use std::convert::Into;
 
-use gasket::runtime::Policy;
+use gasket::metrics::Readings;
+use gasket::runtime::{Policy, TetherState};
 use pallas::crypto::hash::Hash;
 use pallas::ledger::configs::byron::{from_file, GenesisUtxo};
 use pallas::{
@@ -15,7 +16,7 @@ use pallas::{
 
 use serde::Deserialize;
 
-use crate::pipeline::Context;
+use crate::pipeline::{Context, StageTypes};
 use crate::{crosscut, enrich, prelude::*, reducers, sources, storage};
 
 #[derive(Deserialize)]
@@ -34,6 +35,8 @@ pub struct ConfigRoot {
     pub bootstrap_retry: Option<gasket::retries::Policy>,
     pub work_retry: Option<gasket::retries::Policy>,
     pub teardown_retry: Option<gasket::retries::Policy>,
+    pub display: Option<crate::pipeline::console::Config>,
+    pub pipeline: Option<crate::pipeline::Config>,
 }
 
 impl ConfigRoot {
@@ -124,23 +127,253 @@ impl From<ConfigRoot> for Context {
 pub enum RawBlockPayload {
     Genesis,
     Forward(Vec<u8>),
-    Rollback(Vec<u8>, (Point, u64)),
+    Rollback(Vec<Vec<u8>>),
 }
 
 impl RawBlockPayload {
-    pub fn roll_forward(block: Vec<u8>) -> gasket::messaging::Message<Self> {
+    pub fn forward(block: Vec<u8>) -> gasket::messaging::Message<Self> {
         gasket::messaging::Message {
             payload: Self::Forward(block),
         }
     }
 
-    pub fn roll_back(
-        block: Vec<u8>,
-        last_good_block_info: (Point, u64),
-    ) -> gasket::messaging::Message<Self> {
+    pub fn backward(blocks: Vec<Vec<u8>>) -> gasket::messaging::Message<Self> {
         gasket::messaging::Message {
-            payload: Self::Rollback(block, last_good_block_info),
+            payload: Self::Rollback(blocks),
         }
+    }
+}
+
+pub struct TetherSnapshot {
+    pub name: String,
+    pub state: TetherState,
+    pub snapshot: MetricsSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeteredNumber {
+    value: u64,
+}
+
+impl Default for MeteredNumber {
+    fn default() -> Self {
+        Self { value: 0 }
+    }
+}
+
+impl MeteredNumber {
+    pub fn set(&mut self, to: u64) {
+        self.value = to;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeteredString {
+    value: String,
+}
+
+impl Default for MeteredString {
+    fn default() -> Self {
+        Self { value: "".into() }
+    }
+}
+
+impl MeteredString {
+    pub fn set(&mut self, to: &str) {
+        self.value = to.to_string();
+    }
+}
+
+impl From<&str> for MeteredString {
+    fn from(item: &str) -> Self {
+        MeteredString {
+            value: item.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MeteredValue {
+    Numerical(MeteredNumber),
+    Label(MeteredString),
+}
+
+impl MeteredValue {
+    pub fn set_num(&mut self, to: u64) {
+        match self {
+            MeteredValue::Numerical(metered_number) => {
+                metered_number.set(to);
+            }
+            MeteredValue::Label(_) => {}
+        }
+    }
+
+    pub fn set_str(&mut self, to: &str) {
+        match self {
+            MeteredValue::Numerical(_) => {}
+            MeteredValue::Label(metered_string) => {
+                metered_string.set(to);
+            }
+        }
+    }
+
+    pub fn get_num(&self) -> u64 {
+        match self {
+            MeteredValue::Numerical(metered_number) => metered_number.value.clone(),
+            MeteredValue::Label(_) => 0,
+        }
+    }
+
+    pub fn get_string(&self) -> String {
+        match self {
+            MeteredValue::Numerical(_) => "".into(),
+            MeteredValue::Label(metered_string) => metered_string.value.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ProgramOutput {
+    LogBatch(Vec<(String, String)>),
+    Metrics(MetricsSnapshot),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub timestamp: Option<Duration>,
+    pub chain_bar_depth: Option<MeteredValue>,
+    pub chain_bar_progress: Option<MeteredValue>,
+    pub blocks_processed: Option<MeteredValue>,
+    pub transactions: Option<MeteredValue>,
+    pub chain_era: Option<MeteredValue>,
+    pub sources_status: Option<MeteredValue>,
+    pub enrich_status: Option<MeteredValue>,
+    pub reducer_status: Option<MeteredValue>,
+    pub storage_status: Option<MeteredValue>,
+    pub enrich_hit: Option<MeteredValue>,
+    pub enrich_miss: Option<MeteredValue>,
+    pub blocks_ingested: Option<MeteredValue>,
+}
+
+// todo: we need to not need this. it is atrocious and will miss metrics if we forget to add if branches
+pub fn merge_metrics_snapshots(snapshots: &[MetricsSnapshot]) -> MetricsSnapshot {
+    snapshots.iter().fold(
+        MetricsSnapshot {
+            timestamp: None,
+            chain_bar_depth: None,
+            chain_bar_progress: None,
+            blocks_processed: None,
+            transactions: None,
+            chain_era: None,
+            sources_status: None,
+            enrich_status: None,
+            reducer_status: None,
+            storage_status: None,
+            enrich_hit: None,
+            enrich_miss: None,
+            blocks_ingested: None,
+        },
+        |mut acc, snapshot| {
+            // For each field, if the current snapshot has Some value, replace the accumulated value
+            if let Some(val) = &snapshot.timestamp {
+                acc.timestamp.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.chain_bar_depth {
+                acc.chain_bar_depth.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.chain_bar_progress {
+                acc.chain_bar_progress.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.blocks_processed {
+                acc.blocks_processed.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.transactions {
+                acc.transactions.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.chain_era {
+                acc.chain_era.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.sources_status {
+                acc.sources_status.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.enrich_status {
+                acc.enrich_status.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.reducer_status {
+                acc.reducer_status.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.storage_status {
+                acc.storage_status.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.enrich_hit {
+                acc.enrich_hit.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.enrich_miss {
+                acc.enrich_miss.replace(val.clone());
+            }
+            if let Some(val) = &snapshot.blocks_ingested {
+                acc.blocks_ingested.replace(val.clone());
+            }
+            acc
+        },
+    )
+}
+
+impl Default for MetricsSnapshot {
+    fn default() -> Self {
+        Self {
+            timestamp: Some(Default::default()),
+            chain_era: Some(MeteredValue::Label(Default::default())),
+            chain_bar_depth: Some(MeteredValue::Numerical(Default::default())),
+            chain_bar_progress: Some(MeteredValue::Numerical(Default::default())),
+            blocks_processed: Some(MeteredValue::Numerical(Default::default())),
+            transactions: Some(MeteredValue::Numerical(Default::default())),
+            sources_status: Some(MeteredValue::Label(Default::default())),
+            enrich_status: Some(MeteredValue::Label(Default::default())),
+            reducer_status: Some(MeteredValue::Label(Default::default())),
+            storage_status: Some(MeteredValue::Label(Default::default())),
+            enrich_hit: Some(MeteredValue::Numerical(Default::default())),
+            enrich_miss: Some(MeteredValue::Numerical(Default::default())),
+            blocks_ingested: Some(MeteredValue::Numerical(Default::default())),
+        }
+    }
+}
+
+fn merge_field<T: Clone + PartialEq>(target: &mut Option<T>, source: &Option<T>) {
+    if let Some(source_value) = source {
+        match target {
+            Some(target_value) if target_value == source_value => {} // Skip if values are equal
+            _ => *target = Some(source_value.clone()),               // Update if different or None
+        }
+    }
+}
+
+impl MetricsSnapshot {
+    pub fn get_metrics_key(&self, prop_name: &str) -> Option<MeteredValue> {
+        match prop_name {
+            "chain_era" => Some(self.chain_era.clone().unwrap()),
+            "chain_bar_depth" => Some(self.chain_bar_depth.clone().unwrap()),
+            "chain_bar_progress" => Some(self.chain_bar_progress.clone().unwrap()),
+            "blocks_processed" => Some(self.blocks_processed.clone().unwrap()),
+            "transactions" => Some(self.transactions.clone().unwrap()),
+            _ => None,
+        }
+    }
+
+    pub fn merge(&mut self, other: &MetricsSnapshot) {
+        merge_field(&mut self.timestamp, &other.timestamp);
+        merge_field(&mut self.chain_bar_depth, &other.chain_bar_depth);
+        merge_field(&mut self.chain_bar_progress, &other.chain_bar_progress);
+        merge_field(&mut self.blocks_processed, &other.blocks_processed);
+        merge_field(&mut self.transactions, &other.transactions);
+        merge_field(&mut self.chain_era, &other.chain_era);
+        merge_field(&mut self.sources_status, &other.sources_status);
+        merge_field(&mut self.enrich_status, &other.enrich_status);
+        merge_field(&mut self.reducer_status, &other.reducer_status);
+        merge_field(&mut self.storage_status, &other.storage_status);
+        merge_field(&mut self.enrich_hit, &other.enrich_hit);
+        merge_field(&mut self.enrich_miss, &other.enrich_miss);
+        merge_field(&mut self.blocks_ingested, &other.blocks_ingested);
     }
 }
 
@@ -173,9 +406,9 @@ impl BlockContext {
 }
 
 pub enum DecodedBlockAction<'a> {
-    Forward(MultiEraBlock<'a>, &'a BlockContext, Option<(Point, u64)>),
+    Forward(MultiEraBlock<'a>, &'a BlockContext, Option<Point>),
     Genesis(Vec<GenesisUtxo>), // This one probably needs to stay owned
-    Rollback(MultiEraBlock<'a>, &'a BlockContext, Option<(Point, u64)>),
+    Rollback(MultiEraBlock<'a>, &'a BlockContext, Option<Point>),
 }
 
 impl<'a> DecodedBlockAction<'a> {
@@ -183,6 +416,55 @@ impl<'a> DecodedBlockAction<'a> {
         match self {
             Self::Rollback(..) => true,
             _ => false,
+        }
+    }
+
+    pub fn parsed_block(&self) -> Option<&MultiEraBlock> {
+        match self {
+            Self::Forward(block, ..) | Self::Rollback(block, ..) => Some(block),
+            _ => None,
+        }
+    }
+
+    pub fn block_era(&self) -> Era {
+        match self {
+            Self::Rollback(block, ..) | Self::Forward(block, ..) => block.era(),
+            _ => Era::Byron,
+        }
+    }
+
+    pub fn block_rolling_to_hash(&self) -> Hash<32> {
+        match self {
+            Self::Genesis(_) => Hash::new(
+                hex::decode("5f20df933584822601f9e3f8c024eb5eb252fe8cefb24d1317dc3d432e940ebb")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            Self::Rollback(block, ..) | Self::Forward(block, ..) => block.hash(),
+        }
+    }
+
+    pub fn block_rolling_to_point(&self) -> Point {
+        match self {
+            Self::Genesis(_) => Point::new(0 as u64, self.block_rolling_to_hash().to_vec()),
+            Self::Rollback(block, ..) | Self::Forward(block, ..) => {
+                Point::new(block.slot(), block.hash().to_vec())
+            }
+        }
+    }
+
+    pub fn block_tx_count(&self) -> usize {
+        match self {
+            Self::Genesis(utxo) => utxo.len(),
+            Self::Rollback(block, ..) | Self::Forward(block, ..) => block.tx_count(),
+        }
+    }
+
+    pub fn block_number(&self) -> i64 {
+        match self {
+            Self::Genesis(_) => -1,
+            Self::Rollback(block, ..) | Self::Forward(block, ..) => block.number() as i64,
         }
     }
 }
@@ -206,16 +488,12 @@ impl<'a> From<&'a EnrichedBlockPayload> for DecodedBlockAction<'a> {
 
 #[derive(Clone)] // unfortunate that clone needs to be allowed here, gasket clones messages :(
 pub enum EnrichedBlockPayload {
-    Forward(Vec<u8>, BlockContext, Option<(Point, u64)>),
+    Forward(Vec<u8>, BlockContext, Option<Point>),
     Genesis(Vec<GenesisUtxo>),
-    Rollback(Vec<u8>, BlockContext, Option<(Point, u64)>),
+    Rollback(Vec<u8>, BlockContext, Option<Point>),
 }
 
 impl EnrichedBlockPayload {
-    pub fn genesis(self) -> gasket::messaging::Message<Self> {
-        gasket::messaging::Message { payload: self }
-    }
-
     pub fn forward(block: Vec<u8>, ctx: BlockContext) -> gasket::messaging::Message<Self> {
         gasket::messaging::Message {
             payload: Self::Forward(block, ctx, None),
@@ -225,13 +503,14 @@ impl EnrichedBlockPayload {
     pub fn rollback(
         block: Vec<u8>,
         ctx: BlockContext,
-        last_good_block: (Point, u64),
+        previous_block_point: Point,
     ) -> gasket::messaging::Message<Self> {
         gasket::messaging::Message {
-            payload: Self::Rollback(block, ctx, Some(last_good_block)),
+            payload: Self::Rollback(block, ctx, Some(previous_block_point)),
         }
     }
 
+    // possibly should be removed in favor of the into() -> ReducerBlockAction or whatever its called
     pub fn decode_block(&self) -> Option<MultiEraBlock> {
         match self {
             Self::Forward(block, _, _) | Self::Rollback(block, _, _) => {
@@ -294,32 +573,13 @@ pub enum CRDTCommand {
     HashSetMulti(Key, Vec<Member>, Vec<Value>),
     HashUnsetKey(Key, Member),
     UnsetKey(Key),
-    BlockFinished(Point, Vec<u8>, i64, u64, i64, bool),
+    BlockFinished(Point, Option<Vec<u8>>, i64, u64, i64, bool, bool),
     Noop,
 }
 
 impl CRDTCommand {
-    pub fn block_starting(
-        block: Option<&MultiEraBlock>,
-        genesis_hash: Option<&Hash<32>>,
-    ) -> CRDTCommand {
-        match (block, genesis_hash) {
-            (Some(block), None) => {
-                log::debug!("block starting");
-                let hash = block.hash();
-                let slot = block.slot();
-                let point = Point::Specific(slot, hash.to_vec());
-                CRDTCommand::BlockStarting(point)
-            }
-
-            (_, Some(genesis_hash)) => {
-                log::debug!("block starting");
-                let point = Point::Specific(0, genesis_hash.to_vec());
-                CRDTCommand::BlockStarting(point)
-            }
-
-            _ => CRDTCommand::Noop, // never called normally
-        }
+    pub fn block_starting(block_action: &DecodedBlockAction) -> CRDTCommand {
+        CRDTCommand::BlockStarting(block_action.block_rolling_to_point())
     }
 
     pub fn set_add(prefix: Option<&str>, key: &str, member: String) -> CRDTCommand {
@@ -478,13 +738,22 @@ impl CRDTCommand {
 
     pub fn block_finished(
         point: Point,
-        block_bytes: Vec<u8>, // make this take pointer to parsed block
+        block_bytes: Option<Vec<u8>>,
         era: i64,
         tx_len: u64,
         block_number: i64,
         is_rollback: bool,
+        is_genesis: bool,
     ) -> CRDTCommand {
         log::debug!("block finished {:?}", point);
-        CRDTCommand::BlockFinished(point, block_bytes, era, tx_len, block_number, is_rollback)
+        CRDTCommand::BlockFinished(
+            point,
+            block_bytes,
+            era,
+            tx_len,
+            block_number,
+            is_rollback,
+            is_genesis,
+        )
     }
 }

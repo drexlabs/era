@@ -1,5 +1,8 @@
 use chrono::Duration as ChronoDuration;
 use chrono::{DateTime, Utc};
+use gasket::framework::{AsWorkError, WorkSchedule};
+use gasket::messaging::{InputPort, OutputPort};
+use gasket::runtime::Policy;
 use gasket::{
     framework::WorkerError,
     metrics::Reading,
@@ -9,14 +12,17 @@ use lazy_static::lazy_static;
 use log::{warn, Log};
 use ratatui::prelude::Layout;
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Padding};
-use std::ops::{Deref, DerefMut};
+use serde::Deserialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::crosscut;
 
-use super::{Context, StageTypes};
+use crate::model::{MeteredNumber, MeteredString, MeteredValue, MetricsSnapshot, ProgramOutput};
+
+use super::{Context, Pipeline, StageTypes};
 
 use crossterm::{
     event::{self, KeyCode, KeyEventKind},
@@ -26,439 +32,140 @@ use crossterm::{
 use ratatui::{prelude::*, widgets::Paragraph};
 use std::io::{stdout, Stdout};
 
-fn friendly_duration(seconds: i64) -> String {
-    let duration = ChronoDuration::seconds(seconds);
-    let days = duration.num_days();
-    let hours = duration.num_hours() % 24;
-    let minutes = duration.num_minutes() % 60;
-
-    if days > 0 {
-        format!("{} days and {} hours", days, hours)
-    } else if hours > 0 {
-        format!("{} hours and {} minutes", hours, minutes)
-    } else if minutes > 0 {
-        format!("{} minutes", minutes)
-    } else {
-        format!("{} seconds", seconds)
-    }
+pub struct FrameState {
+    last_frame: Instant,
+    frame_times: VecDeque<Duration>,
+    target_fps: u32,
+    sample_window: usize,
 }
 
-fn remaining_time(rate_per_second: f64, total_items: i64, processed_items: i64) -> String {
-    if rate_per_second == 0.0 {
-        return "∞".to_string();
+impl FrameState {
+    pub fn new(target_fps: u32) -> Self {
+        Self {
+            last_frame: Instant::now(),
+            frame_times: VecDeque::with_capacity(60), // 1 second at 60fps
+            target_fps,
+            sample_window: 60,
+        }
     }
 
-    let remaining_items = (total_items - processed_items) as f64;
-    let remaining_seconds = (remaining_items / rate_per_second).ceil() as i64;
+    pub fn record_frame(&mut self) {
+        let now = Instant::now();
+        let frame_time = now.duration_since(self.last_frame);
 
-    friendly_duration(remaining_seconds)
-}
+        if self.frame_times.len() >= self.sample_window {
+            self.frame_times.pop_front();
+        }
+        self.frame_times.push_back(frame_time);
 
-#[derive(clap::ValueEnum, Clone)]
-pub enum Mode {
-    /// shows progress as a plain sequence of logs
-    Plain,
-    /// shows aggregated progress and metrics
-    TUI,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Mode::Plain
+        self.last_frame = now;
     }
-}
 
-#[derive(Clone, Debug)]
-struct MeteredNumber {
-    value: u64,
-}
-
-impl Default for MeteredNumber {
-    fn default() -> Self {
-        Self { value: 0 }
+    pub fn get_target_duration(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.target_fps as f64)
     }
-}
 
-impl MeteredNumber {
-    pub fn set(&mut self, to: u64) {
-        self.value = to;
+    pub fn should_render(&self) -> bool {
+        let now = Instant::now();
+        now.duration_since(self.last_frame) >= self.get_target_duration()
     }
-}
 
-#[derive(Clone, Debug)]
-struct MeteredString {
-    value: String,
-}
+    // Adapts FPS based on actual performance
+    pub fn adapt_fps(&mut self) {
+        if self.frame_times.len() < 30 {
+            return; // Need enough samples
+        }
 
-impl Default for MeteredString {
-    fn default() -> Self {
-        Self { value: "".into() }
-    }
-}
+        let avg_frame_time: Duration =
+            self.frame_times.iter().sum::<Duration>() / self.frame_times.len() as u32;
+        let current_fps = 1.0 / avg_frame_time.as_secs_f64();
 
-impl MeteredString {
-    pub fn set(&mut self, to: &str) {
-        self.value = to.to_string();
-    }
-}
-
-impl From<&str> for MeteredString {
-    fn from(item: &str) -> Self {
-        MeteredString {
-            value: item.to_string(),
+        // If we're consistently taking longer than our frame budget, reduce target FPS
+        if current_fps < (self.target_fps as f64 * 0.9) {
+            self.target_fps = (self.target_fps * 2 / 3).max(30);
+        }
+        // If we have headroom, try to increase FPS
+        else if current_fps > (self.target_fps as f64 * 1.1) {
+            self.target_fps = (self.target_fps * 3 / 2).min(60);
         }
     }
 }
 
-#[derive(Clone, Debug)]
-enum MeteredValue {
-    Numerical(MeteredNumber),
-    Label(MeteredString),
+pub struct Bootstrapper {
+    stage: Stage,
 }
 
-impl MeteredValue {
-    pub fn set_num(&mut self, to: u64) {
-        match self {
-            MeteredValue::Numerical(metered_number) => {
-                metered_number.set(to);
-            }
-            MeteredValue::Label(_) => {}
-        }
+impl Bootstrapper {
+    pub fn borrow_output_port(&mut self) -> &'_ mut OutputPort<()> {
+        &mut self.stage.output
     }
 
-    pub fn set_str(&mut self, to: &str) {
-        match self {
-            MeteredValue::Numerical(_) => {}
-            MeteredValue::Label(metered_string) => {
-                metered_string.set(to);
-            }
-        }
+    pub fn borrow_input_port(&mut self) -> &'_ mut InputPort<ProgramOutput> {
+        &mut self.stage.input
     }
 
-    pub fn get_num(&self) -> u64 {
-        match self {
-            MeteredValue::Numerical(metered_number) => metered_number.value.clone(),
-            MeteredValue::Label(_) => 0,
-        }
-    }
-
-    pub fn get_string(&self) -> String {
-        match self {
-            MeteredValue::Numerical(_) => "".into(),
-            MeteredValue::Label(metered_string) => metered_string.value.clone(),
-        }
+    pub fn spawn_stage(self, policy: Policy) -> gasket::runtime::Tether {
+        gasket::runtime::spawn_stage(self.stage, policy)
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct MetricsSnapshot {
-    timestamp: Duration,
-    chain_bar_depth: MeteredValue,
-    chain_bar_progress: MeteredValue,
-    blocks_processed: MeteredValue,
-    transactions: MeteredValue,
-    chain_era: MeteredValue,
-    sources_status: MeteredValue,
-    enrich_status: MeteredValue,
-    reducer_status: MeteredValue,
-    storage_status: MeteredValue,
-    enrich_hit: MeteredValue,
-    enrich_miss: MeteredValue,
+#[derive(Deserialize)]
+pub struct Config {
+    pub mode: Mode,
 }
 
-impl Default for MetricsSnapshot {
+impl Default for Config {
     fn default() -> Self {
         Self {
-            timestamp: Default::default(),
-            chain_era: MeteredValue::Label(Default::default()),
-            chain_bar_depth: MeteredValue::Numerical(Default::default()),
-            chain_bar_progress: MeteredValue::Numerical(Default::default()),
-            blocks_processed: MeteredValue::Numerical(Default::default()),
-            transactions: MeteredValue::Numerical(Default::default()),
-            sources_status: MeteredValue::Label(Default::default()),
-            enrich_status: MeteredValue::Label(Default::default()),
-            reducer_status: MeteredValue::Label(Default::default()),
-            storage_status: MeteredValue::Label(Default::default()),
-            enrich_hit: MeteredValue::Numerical(Default::default()),
-            enrich_miss: MeteredValue::Numerical(Default::default()),
+            mode: Default::default()
         }
     }
 }
 
-impl MetricsSnapshot {
-    fn get_metrics_key(&self, prop_name: &str) -> Option<MeteredValue> {
-        match prop_name {
-            "chain_era" => Some(self.chain_era.clone()),
-            "chain_bar_depth" => Some(self.chain_bar_depth.clone()),
-            "chain_bar_progress" => Some(self.chain_bar_progress.clone()),
-            "blocks_processed" => Some(self.blocks_processed.clone()),
-            "transactions" => Some(self.transactions.clone()),
-            _ => None,
-        }
-    }
-}
-
-struct LogBuffer {
-    vec: Arc<Mutex<Vec<(String, String)>>>,
-    capacity: usize,
-}
-
-pub struct BlockGraph {
-    vec: Vec<MetricsSnapshot>,
-    base_time: Instant,
-    capacity: usize,
-    last_dropped: Option<MetricsSnapshot>,
-}
-
-impl LogBuffer {
-    // pub fn new(capacity: usize) -> Self {
-    //     //let base_time = Instant::now();
-
-    //     Self {
-    //         vec: Arc::new(Mutex::new(vec![])),
-    //         capacity,
-    //     }
-    // }
-
-    // pub async fn push(&mut self, ele: (String, String)) {
-    //     let mut v = self.vec.lock().await;
-    //     if v.len() == self.capacity {
-    //         v.remove(0);
-    //     }
-
-    //     v.push(ele.clone());
-    // }
-
-    pub async fn all(&self) -> Vec<(String, String)> {
-        self.vec.lock().await.clone()
-    }
-}
-
-impl BlockGraph {
-    pub fn new(capacity: usize) -> Self {
-        let base_time = Instant::now();
-        let vec: Vec<MetricsSnapshot> = Vec::default();
-
-        Self {
-            vec,
-            base_time,
-            capacity,
-            last_dropped: None,
-        }
-    }
-
-    pub fn push(&mut self, ele: MetricsSnapshot) {
-        if self.vec.len() == self.capacity {
-            self.last_dropped = Some(self.vec[0].clone());
-            self.vec.remove(0);
-        }
-
-        self.vec.push(ele);
-    }
-
-    pub fn get(&self, index: usize) -> &MetricsSnapshot {
-        self.vec.get(index).unwrap()
-    }
-
-    pub fn timestamp_window(&self) -> (f64, f64) {
-        let mut min: Duration = Default::default();
-        let mut max: Duration = Default::default();
-
-        for snapshot in self.vec.clone() {
-            let current = snapshot.timestamp;
-
-            if current < min || min == Duration::default() {
-                min = current;
-            }
-
-            if current > max {
-                max = current;
-            }
-        }
-
-        (min.as_secs_f64(), max.as_secs_f64())
-    }
-
-    fn get_prop_value_for_index(&self, prop_name: &str, vec_idx: usize) -> Option<MeteredValue> {
-        match self.vec.get(vec_idx) {
-            Some(snapshot) => match snapshot.get_metrics_key(prop_name) {
-                Some(metrics_value) => Some(metrics_value),
-                None => None,
-            },
-            None => None,
-        }
-    }
-
-    pub fn rates_for_snapshot_prop(&self, prop_name: &str) -> [(f64, f64); RING_DEPTH] {
-        let mut rates: Vec<(f64, f64)> = Default::default();
-
-        let mut stub_metrics_snapshot: MetricsSnapshot = Default::default();
-        stub_metrics_snapshot.timestamp = match self.vec.clone().get(0) {
-            Some(s) => s
-                .timestamp
-                .clone()
-                .checked_sub(Duration::from_millis(1000))
-                .unwrap_or(Duration::default()),
-            _ => stub_metrics_snapshot.timestamp,
+impl Config {
+    pub fn bootstrapper(self, ctx: Arc<Context>) -> Bootstrapper {
+        let stage = Stage {
+            mode: self.mode,
+            input: Default::default(),
+            output: Default::default(),
+            frames_rendered: Default::default(),
+            frame_time: Default::default(),
+            metrics_snapshot_totality: Default::default(),
+            visual_log_buffer: LogBuffer::new(100),
+            ctx,
         };
 
-        let last_dropped = match self.last_dropped.clone() {
-            Some(previous_snapshot) => previous_snapshot,
-            None => stub_metrics_snapshot,
-        };
-
-        for (i, current_snapshot) in self.vec.clone().into_iter().enumerate() {
-            let previous_snapshot = if i > 0 {
-                self.vec.get(i - 1).unwrap().clone()
-            } else {
-                last_dropped.clone()
-            };
-
-            let previous_duration = previous_snapshot.timestamp;
-            let current_duration = current_snapshot.timestamp;
-
-            let previous_value = if i > 0 {
-                self.get_prop_value_for_index(prop_name, i - 1)
-                    .unwrap_or(MeteredValue::Numerical(MeteredNumber { value: 0 }))
-                    .get_num()
-            } else {
-                previous_snapshot
-                    .get_metrics_key(prop_name)
-                    .unwrap()
-                    .get_num()
-            };
-
-            let current_value = self
-                .get_prop_value_for_index(prop_name, i)
-                .unwrap()
-                .get_num();
-
-            let time_diff = if current_duration > previous_duration {
-                (current_duration - previous_duration).as_secs_f64()
-            } else {
-                0.0
-            };
-
-            warn!("comparing values {} {}", current_value, previous_value);
-            let value_diff = current_value - previous_value;
-
-            let rate_of_increase = if time_diff > 0.0 && value_diff > 0 {
-                value_diff as f64 / time_diff
-            } else {
-                0.0
-            };
-
-            rates.push((current_snapshot.timestamp.as_secs_f64(), rate_of_increase));
-        }
-
-        let mut final_rates: [(f64, f64); RING_DEPTH] = [(0.0, 0.0); RING_DEPTH];
-
-        for (i, _) in final_rates.clone().iter().enumerate() {
-            if i + 1 <= rates.len() {
-                final_rates[i] = rates[i];
-            }
-        }
-
-        final_rates
-    }
-
-    pub fn window_for_snapshot_prop(&self, prop_name: &str) -> (f64, f64) {
-        let mut min: f64 = 0.0;
-        let mut max: f64 = 0.0;
-
-        let prop_rates = self.rates_for_snapshot_prop(prop_name);
-
-        for snapshot in prop_rates {
-            if min == 0.0 {
-                min = snapshot.1;
-            }
-
-            if (snapshot.1) < min {
-                min = snapshot.1;
-            }
-
-            if (snapshot.1) > max {
-                max = snapshot.1;
-            }
-        }
-
-        (min, max)
+        Bootstrapper { stage }
     }
 }
 
-struct TuiConsole {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+pub struct ConsoleWorker {
     metrics_buffer: BlockGraph,
+    frame_state: FrameState,
+    terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
-impl Deref for TuiConsole {
-    type Target = Terminal<CrosstermBackend<std::io::Stdout>>;
+impl ConsoleWorker {
+    async fn draw(
+        &mut self,
+        ctx: Arc<Context>,
+        snapshot: &MetricsSnapshot,
+        visual_log_buffer: &LogBuffer,
+    ) {
+        
+        let current_era = snapshot.chain_era.clone().unwrap().get_string(); 
 
-    fn deref(&self) -> &Self::Target {
-        &self.terminal
-    }
-}
+        let provider = crosscut::time::NaiveProvider::new(ctx).await;
+        let wallclock = provider.slot_to_wallclock(snapshot.chain_bar_progress.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num());
+        let d = SystemTime::UNIX_EPOCH + Duration::from_secs(wallclock);
+        let datetime = DateTime::<Utc>::from(d);
+        let date_string = Some(datetime.format("%Y-%m-%d %H:%M:%S").to_string());
 
-impl DerefMut for TuiConsole {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.terminal
-    }
-}
+        let mut log_buffer_string = String::default();
 
-pub fn i64_to_string(mut i: i64) -> String {
-    let mut bytes = Vec::new();
+        let frame = self.terminal.get_frame();
 
-    while i != 0 {
-        let byte = (i & 0xFF) as u8;
-        // Skip if it's a padding byte
-        if byte != 0 {
-            bytes.push(byte);
-        }
-        i >>= 8;
-    }
-
-    let s = std::string::String::from_utf8(bytes).unwrap();
-
-    s.chars().rev().collect::<String>()
-}
-
-const RING_DEPTH: usize = 100;
-
-impl TuiConsole {
-    fn new() -> Self {
-        stdout().execute(EnterAlternateScreen).unwrap();
-        enable_raw_mode().unwrap();
-        Self {
-            terminal: Terminal::new(CrosstermBackend::new(stdout())).unwrap(),
-            metrics_buffer: BlockGraph::new(RING_DEPTH),
-        }
-    }
-
-    async fn draw(&mut self, ctx: Option<Arc<Context>>, snapshot: &MetricsSnapshot) {
-        //let current_era = snapshot.chain_era.get_string();
-
-        let log_buffer_partial = LOG_BUFFER.all().await;
-        let log_buffer_partial = log_buffer_partial.iter().rev();
-
-        let mut date_string = None;
-        let mut has_ctx = false;
-
-        match ctx {
-            Some(ctx) => {
-                let provider = crosscut::time::NaiveProvider::new(ctx.clone()).await;
-                let wallclock = provider.slot_to_wallclock(snapshot.chain_bar_progress.get_num());
-                let d = SystemTime::UNIX_EPOCH + Duration::from_secs(wallclock);
-                let datetime = DateTime::<Utc>::from(d);
-                date_string = Some(datetime.format("%Y-%m-%d %H:%M:%S").to_string());
-                has_ctx = true;
-            }
-
-            None => {}
-        }
-
-        self.terminal
-            .draw(|frame| {
-                let layout = Layout::default()
+        let layout = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints(vec![
                         Constraint::Length(10),
@@ -471,12 +178,13 @@ impl TuiConsole {
                         Constraint::Length(2),
                     ])
                     .split(frame.size());
+        
+        for entry in visual_log_buffer.peek_all().await.iter().rev().take(layout[1].height as usize - 2) {
+            log_buffer_string += &format!("{} {}\n", entry.0, entry.1);
+        }
 
-                let mut log_buffer_string = String::default();
-                for entry in log_buffer_partial.rev().take(layout[1].height as usize - 2) {
-                    log_buffer_string += &format!("{} {}\n", entry.0, entry.1);
-                }
-
+        self.terminal
+            .draw(|frame| {
                 let top_status_layout = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints(vec![Constraint::Length(26), Constraint::Min(60)])
@@ -527,11 +235,10 @@ impl TuiConsole {
                     )
                     .gauge_style(Style::new().blue())
                     .percent(
-                        match snapshot.chain_bar_depth.get_num() > 0
-                            && snapshot.chain_bar_progress.get_num() > 0
+                        match snapshot.chain_bar_depth.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num() > 0
                         {
-                            true => (snapshot.chain_bar_progress.get_num() as f64
-                                / snapshot.chain_bar_depth.get_num() as f64
+                            true => ((snapshot.chain_bar_progress.clone().unwrap_or(crate::model::MeteredValue::Numerical(MeteredNumber::default()))).get_num() as f64
+                                / (snapshot.chain_bar_depth.clone().unwrap_or(crate::model::MeteredValue::Numerical(MeteredNumber::default()))).get_num() as f64
                                 * 100.0)
                                 .round() as u16,
                             false => 0,
@@ -559,7 +266,7 @@ impl TuiConsole {
                 );
 
                 frame.render_widget(
-                    Paragraph::new(snapshot.chain_era.get_string())
+                    Paragraph::new(snapshot.chain_era.clone().unwrap_or(MeteredValue::Label(MeteredString::default())).get_string())
                         .block(ratatui::widgets::Block::new().padding(Padding::new(
                             0, // left
                             1, // right
@@ -599,86 +306,70 @@ impl TuiConsole {
                 //     layout[1],
                 // );
 
-                match has_ctx {
-                    true => {
-                        let status_sublayout = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints(vec![
-                                Constraint::Length(2),
-                                Constraint::Length(1),
-                                Constraint::Min(1),
-                            ])
-                            .split(top_status_layout[1]);
-
-                        let sources_status = snapshot.sources_status.get_string();
-                        let enrich_status = snapshot.enrich_status.get_string();
-                        let reducer_status = snapshot.reducer_status.get_string();
-                        let storage_status = snapshot.storage_status.get_string();
-
-                        frame.render_widget(
-                            Paragraph::new("Gasket Workers")
-                                .block(ratatui::widgets::Block::new().padding(Padding::new(
-                                    0, // left
-                                    0, // right
-                                    0, // top
-                                    0, // bottom
-                                )))
-                                .bold()
-                                .alignment(Alignment::Left),
-                            status_sublayout[1],
-                        );
-
-                        frame.render_widget(
-                            Paragraph::new(format!(
-                                "{} Source\n{} Enrich ({} hits / {} misses)\n{} Reduce\n{} Storage",
-                                if sources_status.is_empty() {
-                                    "⧗".to_string()
-                                } else {
-                                    sources_status
-                                },
-                                if enrich_status.is_empty() {
-                                    "⚠".to_string()
-                                } else {
-                                    enrich_status
-                                },
-                                snapshot.enrich_hit.get_num(),
-                                snapshot.enrich_miss.get_num(),
-                                if reducer_status.is_empty() {
-                                    "⧗".to_string()
-                                } else {
-                                    reducer_status
-                                },
-                                if storage_status.is_empty() {
-                                    "⧗".to_string()
-                                } else {
-                                    storage_status
-                                }
-                            ))
-                            .block(ratatui::widgets::Block::new().padding(Padding::new(
-                                0, // left
-                                0, // right
-                                0, // top
-                                0, // bottom
-                            )))
-                            .alignment(Alignment::Left),
-                            status_sublayout[2],
-                        );
-                    }
-                    false => {
-                        frame.render_widget(
-                            Paragraph::new("Opening historic block buffer...")
-                                .block(ratatui::widgets::Block::new().padding(Padding::new(
-                                    0, // left
-                                    0, // right
-                                    2, // top
-                                    0, // bottom
-                                )))
-                                .alignment(Alignment::Left),
-                            top_status_layout[1],
-                        );
-                    }
-                }
-
+                let status_sublayout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(vec![
+                        Constraint::Length(2),
+                        Constraint::Length(1),
+                        Constraint::Min(1),
+                    ])
+                    .split(top_status_layout[1]);
+                
+                let sources_status = snapshot.sources_status.clone().unwrap_or(MeteredValue::Label(MeteredString::default())).get_string();
+                let enrich_status = snapshot.enrich_status.clone().unwrap_or(MeteredValue::Label(MeteredString::default())).get_string();
+                let reducer_status = snapshot.reducer_status.clone().unwrap_or(MeteredValue::Label(MeteredString::default())).get_string();
+                let storage_status = snapshot.storage_status.clone().unwrap_or(MeteredValue::Label(MeteredString::default())).get_string();
+                
+                frame.render_widget(
+                    Paragraph::new("Gasket Workers")
+                        .block(ratatui::widgets::Block::new().padding(Padding::new(
+                            0, // left
+                            0, // right
+                            0, // top
+                            0, // bottom
+                        )))
+                        .bold()
+                        .alignment(Alignment::Left),
+                    status_sublayout[1],
+                );
+                
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "{} Source ({} blocks)\n{} Enrich ({} hits / {} misses)\n{} Reduce\n{} Storage",
+                        if sources_status.is_empty() {
+                            "⧗".to_string()
+                        } else {
+                            sources_status
+                        },
+                        snapshot.blocks_ingested.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num(),
+                        if enrich_status.is_empty() {
+                            "⚠".to_string()
+                        } else {
+                            enrich_status
+                        },
+                        snapshot.enrich_hit.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num(),
+                        snapshot.enrich_miss.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num(),
+                        if reducer_status.is_empty() {
+                            "⧗".to_string()
+                        } else {
+                            reducer_status
+                        },
+                        if storage_status.is_empty() {
+                            "⧗".to_string()
+                        } else {
+                            storage_status
+                        }
+                    ))
+                        .block(ratatui::widgets::Block::new().padding(Padding::new(
+                            0, // left
+                            0, // right
+                            0, // top
+                            0, // bottom
+                        )))
+                        .alignment(Alignment::Left),
+                    status_sublayout[2],
+                );
+                
                 // frame.render_widget(
                 //     Paragraph::new(snapshot.chain_bar_progress.get_str())
                 //         .block(Block::new().padding(Padding::new(
@@ -690,11 +381,11 @@ impl TuiConsole {
                 //         .alignment(Alignment::Left),
                 //     progress_footer_layout[0],
                 // );
-
+                
                 frame.render_widget(progress, progress_layout[1]);
-
+                
                 frame.render_widget(
-                    Paragraph::new(snapshot.chain_bar_depth.get_num().to_string().as_str())
+                    Paragraph::new(snapshot.chain_bar_depth.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num().to_string().as_str())
                         .block(Block::new().padding(Padding::new(
                             1, // left
                             0, // right
@@ -704,7 +395,7 @@ impl TuiConsole {
                         .alignment(Alignment::Left),
                     progress_layout[2],
                 );
-
+                
                 match date_string {
                     Some(date_string) => {
                         frame.render_widget(
@@ -738,16 +429,11 @@ impl TuiConsole {
                     .metrics_buffer
                     .rates_for_snapshot_prop("blocks_processed");
 
-                let time_remaining = match snapshot.chain_bar_depth.get_num() > 0
-                    && snapshot.chain_bar_progress.get_num() > 0
-                {
-                    true => remaining_time(
-                        chain_bar_progress_metrics.last().unwrap_or(&(0.0, 0.0)).1, // todo make 0 and handle
-                        snapshot.chain_bar_depth.get_num() as i64,
-                        snapshot.chain_bar_progress.get_num() as i64,
-                    ),
-                    false => 0.0.to_string(),
-                };
+                let time_remaining = remaining_time(
+                    chain_bar_progress_metrics.last().unwrap_or(&(0.0, 0.0)).1, // todo make 0 and handle
+                    snapshot.chain_bar_depth.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num() as i64,
+                    snapshot.chain_bar_progress.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num() as i64,
+                );
 
                 frame.render_widget(
                     Paragraph::new(format!("{} remaining", time_remaining))
@@ -810,12 +496,14 @@ impl TuiConsole {
                         .alignment(Alignment::Right),
                     chart_blocks_axis[0],
                 );
+                
                 frame.render_widget(
                     Paragraph::new(format!("{}┈", chain_bar_avg_s))
                         .block(Block::default().style(Style::default().fg(Color::Blue)))
                         .alignment(Alignment::Right),
                     chart_blocks_axis[1],
                 );
+                
                 frame.render_widget(
                     Paragraph::new(format!("{}┈", chain_bar_min_s))
                         .block(Block::default().style(Style::default().fg(Color::Blue)))
@@ -829,12 +517,14 @@ impl TuiConsole {
                         .alignment(Alignment::Left),
                     chart_tx_axis[0],
                 );
+                
                 frame.render_widget(
                     Paragraph::new(format!("┈{}", tx_avg_s))
                         .block(Block::default().style(Style::default().fg(Color::Green)))
                         .alignment(Alignment::Left),
                     chart_tx_axis[1],
                 );
+                
                 frame.render_widget(
                     Paragraph::new(format!("┈{}", tx_min_s))
                         .block(Block::default().style(Style::default().fg(Color::Green)))
@@ -965,156 +655,471 @@ impl TuiConsole {
             })
             .unwrap();
     }
+}
 
-    async fn refresh(&mut self, pipeline: Option<&super::Pipeline>) -> Result<(), WorkerError> {
-        let mut snapshot = MetricsSnapshot::default();
-        snapshot.timestamp = Instant::now().duration_since(self.metrics_buffer.base_time);
+#[derive(gasket::framework::Stage)]
+#[stage(name = "console-renderer", unit = "ProgramOutput", worker = "ConsoleWorker")]
+pub struct Stage {
+    pub mode: Mode,
+    pub input: InputPort<ProgramOutput>,
+    pub output: OutputPort<()>,
+    pub metrics_snapshot_totality: MetricsSnapshot,
+    pub ctx: Arc<Context>,
+    pub visual_log_buffer: LogBuffer,
 
-        // match event::read() {
-        //     Ok(event) => match event {
-        //         crossterm::event::Event::Key(key) => match key.code {
-        //             KeyCode::Char('q') => return Ok(()),
-        //             _ => {}
-        //         },
+    #[metric]
+    frames_rendered: gasket::metrics::Counter,
+    #[metric]
+    frame_time: gasket::metrics::Gauge,
+}
 
-        //         _ => {}
-        //     },
-        //     _ => {}
-        // }
+#[async_trait::async_trait(?Send)]
+impl gasket::framework::Worker<Stage> for ConsoleWorker {
+    async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
+        initialize_logging().await;
 
-        match pipeline {
-            Some(pipeline) => {
-                for tether in pipeline.tethers.iter() {
-                    let state = match tether.check_state() {
-                        TetherState::Dropped => "dropped!",
-                        TetherState::Blocked(_) => "blocked",
-                        TetherState::Alive(a) => match a {
-                            StagePhase::Bootstrap => "⚠",
-                            StagePhase::Working => "⚙",
-                            StagePhase::Teardown => "⚠",
-                            StagePhase::Ended => "ended",
-                        },
-                    };
-
-                    if state == "blocked" {
-                        log::warn!("{} is blocked", tether.name());
-                    }
-
-                    let tether_type: StageTypes = tether.name().into();
-
-                    match tether_type {
-                        StageTypes::Source => {
-                            snapshot.sources_status = MeteredValue::Label(state.into())
-                        }
-                        StageTypes::Enrich => {
-                            snapshot.enrich_status = MeteredValue::Label(state.into())
-                        }
-                        StageTypes::Reduce => {
-                            snapshot.reducer_status = MeteredValue::Label(state.into())
-                        }
-                        StageTypes::Storage => {
-                            snapshot.storage_status = MeteredValue::Label(state.into())
-                        }
-                        StageTypes::Unknown => {}
-                    }
-
-                    match tether.read_metrics() {
-                        Ok(readings) => {
-                            for (key, value) in readings {
-                                match (tether.name(), key, value) {
-                                    (_, "chain_tip", Reading::Gauge(x)) => {
-                                        snapshot.chain_bar_depth.set_num(x as u64);
-                                    }
-                                    (_, "last_block", Reading::Gauge(x)) => {
-                                        snapshot.chain_bar_progress.set_num(x as u64);
-                                    }
-                                    (_, "blocks_processed", Reading::Count(x)) => {
-                                        snapshot.blocks_processed.set_num(x as u64);
-                                    }
-                                    // (_, "received_blocks", Reading::Count(x)) => {
-                                    //     self.received_blocks.set_position(x);
-                                    //     self.received_blocks.set_message(state);
-                                    // }
-                                    // (_, "ops_count", Reading::Count(x)) => {
-                                    //     self.reducer_ops_count.set_position(x);
-                                    //     self.reducer_ops_count.set_message(state);
-                                    // }
-                                    // (_, "reducer_errors", Reading::Count(x)) => {
-                                    //     self.reducer_errors.set_position(x);
-                                    //     self.reducer_errors.set_message(state);
-                                    // }
-                                    // (_, "storage_ops", Reading::Count(x)) => {
-                                    //     self.storage_ops_count.set_position(x);
-                                    //     self.storage_ops_count.set_message(state);
-                                    // }
-                                    (_, "transactions_finalized", Reading::Count(x)) => {
-                                        snapshot.transactions.set_num(x as u64);
-                                    }
-                                    // (_, "enrich_cancelled_empty_tx", Reading::Count(x)) => {
-                                    //     self.enrich_skipped_empty.set_position(x);
-                                    //     self.enrich_skipped_empty.set_message(state);
-                                    // }
-                                    // (_, "enrich_removes", Reading::Count(x)) => {
-                                    //     snapshot.enrich_hit.set_num(x);
-                                    // }
-                                    (_, "enrich_matches", Reading::Count(x)) => {
-                                        snapshot.enrich_hit.set_num(x);
-                                    }
-                                    (_, "enrich_mismatches", Reading::Count(x)) => {
-                                        snapshot.enrich_miss.set_num(x);
-                                    }
-                                    // (_, "enrich_blocks", Reading::Count(x)) => {
-                                    //     self.enrich_blocks.set_position(x);
-                                    //     self.enrich_blocks.set_message(state);
-                                    // }
-                                    // (_, "historic_blocks", Reading::Count(x)) => {
-                                    //     self.historic_blocks.set_position(x);
-                                    //     self.historic_blocks.set_message("");
-                                    // }
-                                    // (_, "historic_blocks_removed", Reading::Count(x)) => {
-                                    //     self.historic_blocks_removed.set_position(x);
-                                    //     self.historic_blocks_removed.set_message("");
-                                    // }
-                                    (_, "chain_era", Reading::Gauge(x)) => {
-                                        if x > 0 {
-                                            snapshot.chain_era.set_str(i64_to_string(x).as_str());
-                                        }
-                                    }
-                                    _ => (),
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            log::warn!("couldn't read metrics");
-                        }
-                    };
-                }
-
-                // Clean up
-
-                self.draw(Some(pipeline.ctx.clone()), &snapshot).await;
-                self.metrics_buffer.push(snapshot);
-            }
-            None => {
-                self.draw(None, &snapshot).await;
-            }
+        if let Mode::TUI = stage.mode {
+            stdout().execute(EnterAlternateScreen).unwrap();
+            enable_raw_mode().unwrap();
         }
+        
+        //warn!("entering console mode");
+        
+        Ok(Self {
+            metrics_buffer: BlockGraph::new(RING_DEPTH),
+            frame_state: FrameState::new(60),
+            terminal: Terminal::new(CrosstermBackend::new(stdout())).unwrap(),
+        })
+    }
 
-        if event::poll(std::time::Duration::from_millis(16)).unwrap() {
-            if let event::Event::Key(key) = event::read().unwrap() {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
-                    stdout().execute(LeaveAlternateScreen).unwrap();
-                    disable_raw_mode().unwrap();
-                    return Err(WorkerError::Panic); // todo start shut down sequence
+    async fn schedule(&mut self, stage: &mut Stage) -> Result<WorkSchedule<ProgramOutput>, WorkerError> {
+        self.terminal.flush().unwrap();
+        
+        match stage
+            .input
+            .recv()
+            .await
+            .map_err(|_| WorkerError::Recv)
+            .map(|u| u.payload)
+        {
+            Ok(program_output) => {
+                if self.frame_state.should_render() {
+                    Ok(WorkSchedule::Unit(program_output))
+                } else {
+                    if let ProgramOutput::LogBatch(log_batch) = program_output {
+                        let mut cloned_buffer: Vec<(String, String)>;
+                        {
+                            let mut buffer_ref = LOG_BUFFER.vec.lock().await;
+                            cloned_buffer = buffer_ref.drain(..).collect();
+                        }
+                        
+                        for item in log_batch {
+                            cloned_buffer.push(item.clone());
+                        }
+                        
+                        Ok(WorkSchedule::Unit(ProgramOutput::LogBatch(cloned_buffer)))
+                    } else {
+                        Ok(WorkSchedule::Idle)
+                    }
+                   
                 }
             }
+            Err(_) => Err(WorkerError::Retry),
         }
+    }
 
-        Ok(())
+    async fn execute(&mut self, unit: &ProgramOutput, stage: &mut Stage) -> Result<(), WorkerError> {
+        let start = Instant::now();
+
+        let unit = match unit.clone() {
+            ProgramOutput::LogBatch(b) => {
+                let mut result = b.clone();
+                result.extend(LOG_BUFFER.vec.lock().await.drain(..));
+                ProgramOutput::LogBatch(result)
+            },
+
+            o => o,
+        };
+        
+        match stage.mode {
+            Mode::TUI => {
+                stage.metrics_snapshot_totality.merge(match &unit { // todo.. there are two fns used that do this same merge.. pick one and use everywhere
+                    ProgramOutput::LogBatch(_) => {
+                        &MetricsSnapshot {
+                            timestamp: None,
+                            chain_bar_depth: None,
+                            chain_bar_progress: None,
+                            blocks_processed: None,
+                            transactions: None,
+                            chain_era: None,
+                            sources_status: None,
+                            enrich_status: None,
+                            reducer_status: None,
+                            storage_status: None,
+                            enrich_hit: None,
+                            enrich_miss: None,
+                            blocks_ingested: None,
+                        }
+                    },
+
+                    ProgramOutput::Metrics(snapshot) => snapshot,
+                });
+
+                if let ProgramOutput::LogBatch(logs) = unit {
+                    for log in logs.clone() {
+                        stage.visual_log_buffer.push(log).await;
+                    }
+                }
+                
+                self.draw(Arc::clone(&stage.ctx), &stage.metrics_snapshot_totality, &stage.visual_log_buffer)
+                    .await;
+
+                self.metrics_buffer.push(stage.metrics_snapshot_totality.clone());
+            }
+            Mode::Plain => {match &unit {
+                ProgramOutput::LogBatch(batch) => {
+                    for log in batch {
+                        stage.visual_log_buffer.push(log.clone()).await;
+                    }
+                }
+
+                ProgramOutput::Metrics(_) => {}
+            }
+
+                let cloned_visual_log_buffer = {stage.visual_log_buffer.vec.lock().await.clone()};
+
+                
+                // Plain console logic
+                self.terminal.draw(|frame| {
+                    // Get the total terminal height
+                    let area = frame.size();
+                    
+                    // Create a layout that pushes your content to the bottom
+                    // This example reserves 3 lines at the bottom
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(0),         // This takes up all extra space
+                            Constraint::Length(3),      // Your app gets 3 lines
+                        ])
+                        .split(area);
+
+
+                    let sub = (String::from("Mike"), String::from("Mike"));
+                    
+                    let stub0 = cloned_visual_log_buffer.get(0).unwrap_or(&sub);
+                    let stub1 = cloned_visual_log_buffer.get(1).unwrap_or(&sub);
+                    let stub2 = cloned_visual_log_buffer.get(2).unwrap_or(&sub);
+                    
+                    let a = format!("{}\n{}\n{}", stub0.0, stub1.0, stub2.0);
+                    
+                    // Render your content in the bottom chunk
+                    let content = Paragraph::new(a)
+                        .block(Block::default()
+                            .borders(Borders::ALL)
+                            .title("Mini App"));
+                    
+                    frame.render_widget(content, chunks[1]);  // Use chunks[1] for the bottom section
+                }).or_retry()?;
+            }
+        };
+
+        self.frame_state.record_frame();
+        self.frame_state.adapt_fps();
+
+        stage.frame_time.set(start.elapsed().as_micros() as i64);
+        stage.frames_rendered.inc(1);
+
+        stage
+            .output
+            .send(().into())
+            .await
+            .map_err(|_| WorkerError::Send)
     }
 }
 
-impl Log for TuiConsole {
+fn friendly_duration(seconds: i64) -> String {
+    let duration = ChronoDuration::seconds(seconds);
+    let days = duration.num_days();
+    let hours = duration.num_hours() % 24;
+    let minutes = duration.num_minutes() % 60;
+
+    if days > 0 {
+        format!("{} days and {} hours", days, hours)
+    } else if hours > 0 {
+        format!("{} hours and {} minutes", hours, minutes)
+    } else if minutes > 0 {
+        format!("{} minutes", minutes)
+    } else {
+        format!("{} seconds", seconds)
+    }
+}
+
+fn remaining_time(rate_per_second: f64, total_items: i64, processed_items: i64) -> String {
+    if rate_per_second == 0.0 {
+        return "∞".to_string();
+    }
+
+    let remaining_items = (total_items - processed_items) as f64;
+    let remaining_seconds = (remaining_items / rate_per_second).ceil() as i64;
+
+    friendly_duration(remaining_seconds)
+}
+
+#[derive(clap::ValueEnum, Deserialize, Clone)]
+pub enum Mode {
+    /// shows progress as a plain sequence of logs
+    Plain,
+    /// shows aggregated progress and metrics
+    TUI,
+}
+
+impl Default for Mode {
+    fn default() -> Self {
+        Mode::Plain
+    }
+}
+
+
+
+pub struct BlockGraph {
+    vec: VecDeque<MetricsSnapshot>,
+    base_time: Instant,
+    capacity: usize,
+    last_dropped: Option<MetricsSnapshot>,
+}
+
+impl BlockGraph {
+    pub fn new(capacity: usize) -> Self {
+        let base_time = Instant::now();
+        let vec: VecDeque<MetricsSnapshot> = Default::default();
+
+        Self {
+            vec,
+            base_time,
+            capacity,
+            last_dropped: None,
+        }
+    }
+
+    pub fn push(&mut self, ele: MetricsSnapshot) {
+        if self.vec.len() == self.capacity {
+            self.last_dropped = self.vec.pop_front();
+        }
+        self.vec.push_back(ele);
+    }
+
+    pub fn get(&self, index: usize) -> &MetricsSnapshot {
+        self.vec.get(index).unwrap()
+    }
+
+    pub fn timestamp_window(&self) -> (f64, f64) {
+        let mut min: Duration = Default::default();
+        let mut max: Duration = Default::default();
+
+        for snapshot in self.vec.clone() {
+            let current = snapshot.timestamp.unwrap();
+
+            if current < min || min == Duration::default() {
+                min = current;
+            }
+
+            if current > max {
+                max = current;
+            }
+        }
+
+        (min.as_secs_f64(), max.as_secs_f64())
+    }
+
+    fn get_prop_value_for_index(&self, prop_name: &str, vec_idx: usize) -> Option<MeteredValue> {
+        match self.vec.get(vec_idx) {
+            Some(snapshot) => match snapshot.get_metrics_key(prop_name) {
+                Some(metrics_value) => Some(metrics_value),
+                None => None,
+            },
+            None => None,
+        }
+    }
+
+    pub fn rates_for_snapshot_prop(&self, prop_name: &str) -> [(f64, f64); RING_DEPTH] {
+        let mut rates: Vec<(f64, f64)> = Default::default();
+
+        let mut stub_metrics_snapshot: MetricsSnapshot = Default::default();
+        stub_metrics_snapshot.timestamp = match self.vec.clone().get(0) {
+            Some(s) => s
+                .timestamp.unwrap()
+                .checked_sub(Duration::from_millis(1000)),
+            _ => stub_metrics_snapshot.timestamp,
+        };
+
+        let last_dropped = match self.last_dropped.clone() {
+            Some(previous_snapshot) => previous_snapshot,
+            None => stub_metrics_snapshot,
+        };
+
+        for (i, current_snapshot) in self.vec.clone().into_iter().enumerate() {
+            let previous_snapshot = if i > 0 {
+                self.vec.get(i - 1).unwrap().clone()
+            } else {
+                last_dropped.clone()
+            };
+
+            let previous_duration = previous_snapshot.timestamp;
+            let current_duration = current_snapshot.timestamp;
+
+            let previous_value = if i > 0 {
+                self.get_prop_value_for_index(prop_name, i - 1)
+                    .unwrap_or(MeteredValue::Numerical(MeteredNumber::default()))
+                    .get_num()
+            } else {
+                previous_snapshot
+                    .get_metrics_key(prop_name)
+                    .unwrap()
+                    .get_num()
+            };
+
+            let current_value = self
+                .get_prop_value_for_index(prop_name, i)
+                .unwrap()
+                .get_num();
+
+            let time_diff = if current_duration > previous_duration {
+                (current_duration.unwrap() - previous_duration.unwrap()).as_secs_f64()
+            } else {
+                0.0
+            };
+
+            let value_diff = match (current_value, previous_value) {
+                (0, _) => 0,
+                (_, 0) => current_value,
+                (curr, prev) => curr - prev,
+            };
+
+            let rate_of_increase = if time_diff > 0.0 && value_diff > 0 {
+                value_diff as f64 / time_diff
+            } else {
+                0.0
+            };
+
+            rates.push((current_snapshot.timestamp.unwrap().as_secs_f64(), rate_of_increase));
+        }
+
+        let mut final_rates: [(f64, f64); RING_DEPTH] = [(0.0, 0.0); RING_DEPTH];
+
+        for (i, _) in final_rates.clone().iter().enumerate() {
+            if i + 1 <= rates.len() {
+                final_rates[i] = rates[i];
+            }
+        }
+
+        final_rates
+    }
+
+    pub fn window_for_snapshot_prop(&self, prop_name: &str) -> (f64, f64) {
+        let mut min: f64 = 0.0;
+        let mut max: f64 = 0.0;
+
+        let prop_rates = self.rates_for_snapshot_prop(prop_name);
+
+        for snapshot in prop_rates {
+            if min == 0.0 {
+                min = snapshot.1;
+            }
+
+            if (snapshot.1) < min {
+                min = snapshot.1;
+            }
+
+            if (snapshot.1) > max {
+                max = snapshot.1;
+            }
+        }
+
+        (min, max)
+    }
+}
+
+// impl Deref for TuiConsole {
+//     type Target = Terminal<CrosstermBackend<std::io::Stdout>>;
+
+//     fn deref(&self) -> &Self::Target {
+//         &self.terminal
+//     }
+// }
+
+// impl DerefMut for TuiConsole {
+//     fn deref_mut(&mut self) -> &mut Self::Target {
+//         &mut self.terminal
+//     }
+// }
+
+pub fn i64_to_string(mut i: i64) -> String {
+    let mut bytes = Vec::new();
+
+    while i != 0 {
+        let byte = (i & 0xFF) as u8;
+        // Skip if it's a padding byte
+        if byte != 0 {
+            bytes.push(byte);
+        }
+        i >>= 8;
+    }
+
+    let s = std::string::String::from_utf8(bytes).unwrap();
+
+    s.chars().rev().collect::<String>()
+}
+
+const RING_DEPTH: usize = 100;
+
+struct BufferedLogger {
+    output: Arc<Mutex<OutputPort<ProgramOutput>>>,
+    runtime: tokio::runtime::Runtime,
+}
+
+// impl Deref for TuiConsole {
+//     type Target = Terminal<CrosstermBackend<std::io::Stdout>>;
+
+//     fn deref(&self) -> &Self::Target {
+//         &self.terminal
+//     }
+// }
+
+// impl DerefMut for TuiConsole {
+//     fn deref_mut(&mut self) -> &mut Self::Target {
+//         &mut self.terminal
+//     }
+// }
+
+impl BufferedLogger {
+    fn new() -> Self {
+        Self {
+            output: Default::default(),
+            runtime: tokio::runtime::Runtime::new().unwrap(),
+        }
+    }
+
+    pub fn borrow_output_port(&self) -> MutexGuard<OutputPort<ProgramOutput>> {
+        self.output.blocking_lock() 
+    }
+
+    fn batch_logs_out(&self) {
+        let batch = {
+            let mut guard = LOG_BUFFER.vec.blocking_lock();
+            if guard.len() > 0 {
+                std::mem::replace(&mut *guard, Default::default())
+            } else {
+                Default::default()
+            }
+        };
+        
+        self.runtime.block_on(self.borrow_output_port().send(gasket::messaging::Message::from(ProgramOutput::LogBatch(batch)))).unwrap();
+    }
+
+}
+
+impl log::Log for BufferedLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         metadata.level() >= log::Level::Info
     }
@@ -1132,139 +1137,54 @@ impl Log for TuiConsole {
         });
     }
 
-    fn flush(&self) {}
-}
-
-struct PlainConsole {
-    //last_report: Mutex<Instant>,
-}
-
-impl PlainConsole {
-    fn new() -> Self {
-        Self {
-            //last_report: Mutex::new(Instant::now()),
-        }
-    }
-
-    fn refresh(&self, pipeline: Option<&super::Pipeline>) -> Result<(), WorkerError> {
-        match pipeline {
-            Some(pipeline) => {
-                for tether in pipeline.tethers.iter() {
-                    match tether.check_state() {
-                        gasket::runtime::TetherState::Dropped => {
-                            log::error!("[{}] stage tether has been dropped", tether.name());
-                        }
-                        gasket::runtime::TetherState::Blocked(_) => {
-                            log::warn!(
-                                "[{}] stage tehter is blocked or not reporting state",
-                                tether.name(),
-                            );
-                        }
-                        gasket::runtime::TetherState::Alive(state) => {
-                            log::debug!(
-                                "[{}] stage is alive with state: {:?}",
-                                tether.name(),
-                                state
-                            );
-                            match tether.read_metrics() {
-                                Ok(readings) => {
-                                    for (key, value) in readings {
-                                        log::debug!(
-                                            "[{}] metric `{}` = {:?}",
-                                            tether.name(),
-                                            key,
-                                            value
-                                        );
-                                    }
-                                }
-                                Err(err) => {
-                                    log::error!(
-                                        "[{}] error reading metrics: {}",
-                                        tether.name(),
-                                        err
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            None => {}
-        }
-
-        Ok(())
-    }
-}
-
-impl log::Log for PlainConsole {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
-    }
-
-    fn log(&self, record: &log::Record) {
-        eprintln!("{}", record.args())
-    }
-
-    fn flush(&self) {}
-}
-
-enum Logger {
-    Tui(TuiConsole),
-    Plain(PlainConsole),
-}
-
-impl log::Log for Logger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        match self {
-            Self::Tui(tui_console) => tui_console.enabled(metadata),
-            Self::Plain(plain_console) => plain_console.enabled(metadata),
-        }
-    }
-
-    fn log(&self, record: &log::Record) {
-        match self {
-            Self::Tui(tui_console) => tui_console.log(record),
-            Self::Plain(plain_console) => plain_console.log(record),
-        }
-    }
-
     fn flush(&self) {
-        match self {
-            Self::Tui(tui_console) => tui_console.flush(),
-            Self::Plain(_plain_console) => {}
-        }
+        self.batch_logs_out();
     }
 }
 
-lazy_static! {
-    static ref TUI_CONSOLE: Mutex<TuiConsole> = Mutex::new(TuiConsole::new());
-}
-
-lazy_static! {
-    static ref PLAIN_CONSOLE: PlainConsole = PlainConsole::new();
-}
-
-lazy_static! {
-    static ref LOG_BUFFER: LogBuffer = LogBuffer {
-        vec: Arc::new(Mutex::new(Vec::new())),
-        capacity: 100,
-    };
-}
-pub async fn initialize(mode: &Mode) {
-    let logger = match mode {
-        Mode::TUI => Logger::Tui(TuiConsole::new()),
-        _ => Logger::Plain(PlainConsole::new()),
-    };
-
-    log::set_boxed_logger(Box::new(logger))
+async fn initialize_logging() {
+    log::set_boxed_logger(Box::new(BufferedLogger::new()))
         .map(|_| log::set_max_level(log::LevelFilter::Info))
         .unwrap();
 }
 
-// note: this is what gets repeatedly called for redraws.. its gross.. want to make this more direct
-pub async fn refresh(mode: &Mode, pipeline: Option<&super::Pipeline>) -> Result<(), WorkerError> {
-    match mode {
-        Mode::TUI => TUI_CONSOLE.lock().await.refresh(pipeline).await,
-        _ => PLAIN_CONSOLE.refresh(pipeline),
+struct LogBuffer {
+    vec: Arc<Mutex<Vec<(String, String)>>>,
+    capacity: usize,
+}
+
+impl LogBuffer {
+    pub fn new(capacity: usize) -> Self {
+        //let base_time = Instant::now();
+
+        Self {
+            vec: Arc::new(Mutex::new(vec![])),
+            capacity,
+        }
     }
+
+    pub async fn push(&mut self, ele: (String, String)) {
+        let mut v = self.vec.lock().await;
+        if v.len() == self.capacity {
+            v.remove(0);
+        }
+
+        v.push(ele.clone());
+    }
+
+    pub async fn peek_all(&self) -> Vec<(String, String)> {
+        self.vec.lock().await.clone()
+    }
+
+    pub async fn take_all(&self) -> Vec<(String, String)> {
+        self.vec.lock().await.drain(..).collect()
+    }
+}
+
+lazy_static! {
+    static ref CONSOLE_MOCK_STAGE: Mutex<BufferedLogger> = Mutex::new(BufferedLogger::new());
+}
+
+lazy_static! {
+    static ref LOG_BUFFER: LogBuffer = LogBuffer::new(100);
 }

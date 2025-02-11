@@ -12,7 +12,7 @@ pub struct Config {
 
 pub struct Reducer {
     config: Config,
-    output: OutputPort<CRDTCommand>,
+    pub output: OutputPort<CRDTCommand>,
 }
 
 impl Reducer {
@@ -39,7 +39,7 @@ impl Reducer {
     pub async fn reduce<'a>(&mut self, block: &'a DecodedBlockAction<'a>) -> Result<(), Error> {
         match block {
             // todo: no genesis support
-            DecodedBlockAction::Genesis(genesis_utxo) => Ok(()),
+            DecodedBlockAction::Genesis(_) => Ok(()),
 
             action @ (DecodedBlockAction::Forward(b, c, p)
             | DecodedBlockAction::Rollback(b, c, p)) => {

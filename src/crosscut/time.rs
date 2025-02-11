@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use pallas::ledger::traverse::wellknown::GenesisValues;
-use tokio::sync::Mutex;
 
 use crate::pipeline::Context;
 

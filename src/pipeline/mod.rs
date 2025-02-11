@@ -1,17 +1,30 @@
 pub mod console;
 
-use std::{cell::RefCell, sync::Arc};
+use std::borrow::BorrowMut;
+use std::cell::RefCell;
+use std::sync::Arc;
 
 use crate::{crosscut, model::ConfigRoot};
 
+use crate::model::{
+    merge_metrics_snapshots, MeteredValue, MetricsSnapshot, ProgramOutput, TetherSnapshot,
+};
+use console::Mode;
+use futures::TryFutureExt;
+use gasket::messaging::tokio::funnel_ports;
+use gasket::messaging::OutputPort;
+use gasket::metrics::Reading;
 use gasket::{
     framework::*,
     messaging::tokio::connect_ports,
     runtime::{Policy, StagePhase, Tether, TetherState},
 };
+use log::warn;
 use pallas::ledger::{configs::byron::GenesisFile, traverse::wellknown::GenesisValues};
+use serde::Deserialize;
+use tokio::time::{sleep, Instant};
 
-static GASKET_CAP: usize = 100;
+pub static GASKET_CAP: usize = 100;
 
 pub enum StageTypes {
     Source,
@@ -43,11 +56,51 @@ impl std::convert::From<&str> for StageTypes {
     }
 }
 
+pub struct Bootstrapper {
+    pub stage: Stage,
+}
+
+impl Bootstrapper {
+    pub fn spawn_stage(self, policy: Policy) -> gasket::runtime::Tether {
+        gasket::runtime::spawn_stage(self.stage, policy)
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Config {
+    pub display_mode: Option<console::Mode>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            display_mode: Some(console::Mode::Plain),
+        }
+    }
+}
+
+impl Config {
+    pub fn bootstrapper(self, root_config: RefCell<ConfigRoot>) -> Bootstrapper {
+        Bootstrapper {
+            stage: Stage {
+                output: Default::default(),
+                config: root_config,
+                stage_config: self,
+            },
+        }
+    }
+}
+
 #[derive(Stage)]
-#[stage(name = "pipeline-bootstrapper", unit = "()", worker = "Pipeline")]
+#[stage(
+    name = "pipeline-bootstrapper",
+    unit = "Vec<MetricsSnapshot>",
+    worker = "Pipeline"
+)]
 pub struct Stage {
     pub config: RefCell<ConfigRoot>,
-    pub args_console: Arc<console::Mode>,
+    pub output: RefCell<OutputPort<ProgramOutput>>,
+    pub stage_config: Config,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -55,28 +108,21 @@ impl gasket::framework::Worker<Stage> for Pipeline {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
         let mut config = stage.config.borrow_mut();
 
-        console::initialize(stage.args_console.as_ref()).await;
-
-        console::refresh(stage.args_console.as_ref(), None).await?;
-
         let mut pipe = Self {
             policy: config.gasket_policy(),
             tethers: Default::default(),
+            tether_states: Default::default(),
             chain_config: Arc::new(config.chain.take().unwrap_or_default()),
             ctx: config.take_some_to_make_context(),
         };
 
-        console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
+        let output = config.display.take().unwrap_or_default();
+
+        let mut output_stage = output.bootstrapper(Arc::clone(&pipe.ctx));
 
         let enrich = config.enrich.take().unwrap_or_default();
 
-        log::warn!("getting latest intersection (this may take awhile)");
-
-        console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
-
         let mut enrich_stage = enrich.bootstrapper(Arc::clone(&pipe.ctx));
-
-        console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
 
         let mut storage_stage = config
             .storage
@@ -89,14 +135,14 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             .source
             .take()
             .unwrap()
-            .bootstrapper(Arc::clone(&pipe.ctx), storage_stage.build_cursor())
+            .bootstrapper(Arc::clone(&pipe.ctx), storage_stage.build_cursor()) // todo check into this build_cursor again
             .unwrap();
 
         let mut reducers_stage = config
             .reducers
             .take()
             .unwrap()
-            .bootstrapper(Arc::clone(&pipe.ctx));
+            .bootstrapper(Arc::clone(&pipe.ctx), storage_stage.borrow_input_port());
 
         connect_ports(
             source_stage.borrow_output_port(),
@@ -110,11 +156,16 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             GASKET_CAP,
         );
 
-        connect_ports(
-            reducers_stage.borrow_output_port(),
-            storage_stage.borrow_input_port(),
+        funnel_ports(
+            vec![&mut stage.output.borrow_mut()],
+            output_stage.borrow_input_port(),
             GASKET_CAP,
         );
+
+        pipe.tethers
+            .push(output_stage.spawn_stage(pipe.policy.clone()));
+
+        pipe.wait_for_tethers();
 
         pipe.tethers
             .push(storage_stage.spawn_stage(pipe.policy.clone()));
@@ -122,72 +173,212 @@ impl gasket::framework::Worker<Stage> for Pipeline {
         pipe.tethers
             .push(reducers_stage.spawn_stage(pipe.policy.clone()));
 
-        let mut tether_error = false;
-
-        log::info!("pipeline: spawning tethers");
-
-        loop {
-            console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
-
-            let mut bootstrapping_consumers = false;
-            for tether in &pipe.tethers {
-                match tether.check_state() {
-                    TetherState::Blocked(_) => {
-                        bootstrapping_consumers = true;
-                    }
-                    TetherState::Dropped => {
-                        log::info!("pipeline: dropped tether {}", tether.name());
-                        tether_error = true;
-                        break;
-                    }
-                    TetherState::Alive(s) => match s {
-                        StagePhase::Bootstrap => {
-                            bootstrapping_consumers = true;
-                        }
-                        StagePhase::Teardown => {
-                            log::info!("pipeline: tore down {}", tether.name());
-                            tether_error = true;
-                        }
-                        StagePhase::Ended => {
-                            log::info!("pipeline: ended {}", tether.name());
-                            tether_error = true;
-                        }
-                        StagePhase::Working => {
-                            bootstrapping_consumers = false;
-                        }
-                    },
-                }
-                console::refresh(stage.args_console.as_ref(), Some(&pipe)).await?;
-            }
-
-            if tether_error {
-                log::info!("pipeline: tether startup error");
-                return Err(WorkerError::Panic);
-            }
-
-            if !bootstrapping_consumers {
-                break;
-            }
-        }
+        //pipe.wait_for_tethers();
 
         pipe.tethers
             .push(enrich_stage.spawn_stage(pipe.policy.clone()));
 
-        log::info!("pipeline: reached data source tether");
         pipe.tethers
             .push(source_stage.spawn_stage(pipe.policy.clone()));
-
-        log::info!("pipeline: all tethers are alive");
 
         return Ok(pipe);
     }
 
-    async fn schedule(&mut self, _: &mut Stage) -> Result<WorkSchedule<()>, WorkerError> {
-        Ok(WorkSchedule::Unit(()))
+    async fn schedule(
+        &mut self,
+        stage: &mut Stage,
+    ) -> Result<WorkSchedule<Vec<MetricsSnapshot>>, WorkerError> {
+        let mut accum_snap = MetricsSnapshot {
+            timestamp: None,
+            chain_bar_depth: None,
+            chain_bar_progress: None,
+            blocks_processed: None,
+            transactions: None,
+            chain_era: None,
+            sources_status: None,
+            enrich_status: None,
+            reducer_status: None,
+            storage_status: None,
+            enrich_hit: None,
+            enrich_miss: None,
+            blocks_ingested: None,
+        };
+
+        let accumulated_state: Vec<MetricsSnapshot> = self
+            .tethers
+            .iter()
+            .map(|tether| {
+                let snapshot_status_text = match tether.check_state() {
+                    TetherState::Dropped => "dropped!",
+                    TetherState::Blocked(_) => "blocked",
+                    TetherState::Alive(a) => match a {
+                        StagePhase::Bootstrap => "⚠",
+                        StagePhase::Working => "⚙",
+                        StagePhase::Teardown => "⚠",
+                        StagePhase::Ended => "ended",
+                    },
+                };
+
+                match tether.name() {
+                    "source" => accum_snap
+                        .sources_status
+                        .replace(MeteredValue::Label(snapshot_status_text.into())),
+                    "enrich" => accum_snap
+                        .enrich_status
+                        .replace(MeteredValue::Label(snapshot_status_text.into())),
+                    "reduce" => accum_snap
+                        .reducer_status
+                        .replace(MeteredValue::Label(snapshot_status_text.into())),
+                    "storage" => accum_snap
+                        .storage_status
+                        .replace(MeteredValue::Label(snapshot_status_text.into())),
+                    _ => None,
+                };
+
+                tether.read_metrics().map(|readings| {
+                    readings.iter().fold(
+                        accum_snap.clone(),
+                        |mut snapshot, (metric_key_name, reading)| {
+                            let t_name = tether.name().clone();
+
+                            match (t_name, &**metric_key_name, reading) {
+                                // todo: lmfao clearly the wrong approach is being used by me here. &**, ghastly.
+                                (_, "chain_tip", Reading::Gauge(x)) => {
+                                    let mut a = snapshot
+                                        .chain_bar_depth
+                                        .clone()
+                                        .unwrap_or(MeteredValue::Numerical(Default::default()));
+                                    a.set_num(x.clone() as u64);
+                                    snapshot.chain_bar_depth.replace(a);
+
+                                    snapshot
+                                }
+                                (_, "last_block", Reading::Gauge(x)) => {
+                                    let mut a = snapshot
+                                        .chain_bar_progress
+                                        .clone()
+                                        .unwrap_or(MeteredValue::Numerical(Default::default()));
+                                    a.set_num(x.clone() as u64);
+                                    snapshot.chain_bar_progress.replace(a);
+
+                                    snapshot
+                                }
+                                (_, "blocks_processed", Reading::Count(x)) => {
+                                    let mut a = snapshot
+                                        .blocks_processed
+                                        .clone()
+                                        .unwrap_or(MeteredValue::Numerical(Default::default()));
+                                    a.set_num(x.clone());
+                                    snapshot.blocks_processed.replace(a);
+
+                                    snapshot
+                                }
+                                // (_, "received_blocks", Reading::Count(x)) => {
+                                //     self.received_blocks.set_position(x);
+                                //     self.received_blocks.set_message(state);
+                                // }
+                                // (_, "ops_count", Reading::Count(x)) => {
+                                //     self.reducer_ops_count.set_position(x);
+                                //     self.reducer_ops_count.set_message(state);
+                                // }
+                                // (_, "reducer_errors", Reading::Count(x)) => {
+                                //     self.reducer_errors.set_position(x);
+                                //     self.reducer_errors.set_message(state);
+                                // }
+                                // (_, "storage_ops", Reading::Count(x)) => {
+                                //     self.storage_ops_count.set_position(x);
+                                //     self.storage_ops_count.set_message(state);
+                                // }
+                                (_, "transactions_finalized", Reading::Count(x)) => {
+                                    let mut a = snapshot
+                                        .transactions
+                                        .clone()
+                                        .unwrap_or(MeteredValue::Numerical(Default::default()));
+                                    a.set_num(x.clone());
+                                    snapshot.transactions.replace(a);
+
+                                    snapshot
+                                }
+                                // (_, "enrich_cancelled_empty_tx", Reading::Count(x)) => {
+                                //     self.enrich_skipped_empty.set_position(x);
+                                //     self.enrich_skipped_empty.set_message(state);
+                                // }
+                                // (_, "enrich_removes", Reading::Count(x)) => {
+                                //     snapshot.enrich_hit.set_num(x);
+                                // }
+                                (_, "enrich_matches", Reading::Count(x)) => {
+                                    let mut a = snapshot
+                                        .enrich_hit
+                                        .clone()
+                                        .unwrap_or(MeteredValue::Numerical(Default::default()));
+                                    a.set_num(x.clone());
+                                    snapshot.enrich_hit.replace(a);
+
+                                    snapshot
+                                }
+                                (_, "blocks_ingested", Reading::Count(x)) => {
+                                    let mut a = snapshot
+                                        .blocks_ingested
+                                        .clone()
+                                        .unwrap_or(MeteredValue::Numerical(Default::default()));
+                                    a.set_num(x.clone());
+
+                                    snapshot.blocks_ingested.replace(a);
+
+                                    snapshot
+                                }
+                                // (_, "enrich_blocks", Reading::Count(x)) => {
+                                //     self.enrich_blocks.set_position(x);
+                                //     self.enrich_blocks.set_message(state);
+                                // }
+                                // (_, "historic_blocks", Reading::Count(x)) => {
+                                //     self.historic_blocks.set_position(x);
+                                //     self.historic_blocks.set_message("");
+                                // }
+                                // (_, "historic_blocks_removed", Reading::Count(x)) => {
+                                //     self.historic_blocks_removed.set_position(x);
+                                //     self.historic_blocks_removed.set_message("");
+                                // }
+                                (_, "chain_era", Reading::Gauge(x)) => {
+                                    if x.clone() > 0 {
+                                        let mut a = snapshot
+                                            .chain_era
+                                            .clone()
+                                            .unwrap_or(MeteredValue::Label(Default::default()));
+                                        a.set_str(i64_to_string(x.clone()).as_str());
+
+                                        snapshot.chain_era.replace(a);
+                                    }
+
+                                    snapshot
+                                }
+                                _ => snapshot,
+                            }
+                        },
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .or_retry()?;
+
+        Ok(WorkSchedule::Unit(accumulated_state))
     }
 
-    async fn execute(&mut self, _: &(), stage: &mut Stage) -> Result<(), WorkerError> {
-        console::refresh(&stage.args_console, Some(self)).await
+    async fn execute(
+        &mut self,
+        unit: &Vec<MetricsSnapshot>,
+        stage: &mut Stage,
+    ) -> Result<(), WorkerError> {
+        stage
+            .output
+            .borrow_mut()
+            .send(gasket::messaging::Message {
+                payload: ProgramOutput::Metrics(merge_metrics_snapshots(unit)),
+            })
+            .map_err(|_| WorkerError::Send)
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -196,6 +387,7 @@ pub struct Pipeline {
     pub tethers: Vec<Tether>,
     pub ctx: Arc<Context>,
     pub chain_config: Arc<crosscut::ChainConfig>,
+    pub tether_states: Vec<TetherState>,
 }
 
 pub fn i64_to_string(mut i: i64) -> String {
@@ -212,13 +404,9 @@ pub fn i64_to_string(mut i: i64) -> String {
 }
 
 impl Pipeline {
-    pub fn bootstrap_gasket_stage(
-        config: RefCell<ConfigRoot>,
-        args_console: Arc<console::Mode>,
-    ) -> Stage {
-        Stage {
-            config,
-            args_console,
+    pub fn wait_for_tethers(&mut self) {
+        for tether in &self.tethers {
+            tether.wait_state(TetherState::Alive(StagePhase::Working));
         }
     }
 

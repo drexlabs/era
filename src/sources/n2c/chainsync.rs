@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use futures::TryFutureExt;
 use gasket::messaging::OutputPort;
+use pallas::ledger::configs::byron::genesis_utxos;
 use pallas::ledger::traverse::MultiEraBlock;
 use pallas::network::facades::NodeClient;
 use pallas::network::miniprotocols::chainsync::NextResponse;
@@ -8,7 +10,7 @@ use pallas::network::miniprotocols::Point;
 
 use gasket::framework::{Stage as StageTrait, *};
 
-use crate::model::RawBlockPayload;
+use crate::model::{EnrichedBlockPayload, RawBlockPayload};
 use crate::pipeline::Context;
 use crate::{crosscut, sources, storage};
 
@@ -21,7 +23,7 @@ pub struct Worker {
 impl Worker {}
 
 #[derive(Stage)]
-#[stage(name = "sources-n2c", unit = "Vec<RawBlockPayload>", worker = "Worker")]
+#[stage(name = "sources-n2c", unit = "RawBlockPayload", worker = "Worker")]
 pub struct Stage {
     pub config: sources::n2c::Config,
     pub cursor: storage::Cursor,
@@ -106,83 +108,32 @@ impl gasket::framework::Worker<Stage> for Worker {
     async fn schedule(
         &mut self,
         stage: &mut Stage,
-    ) -> Result<WorkSchedule<Vec<RawBlockPayload>>, WorkerError> {
+    ) -> Result<WorkSchedule<RawBlockPayload>, WorkerError> {
         let peer = self.peer.as_mut().unwrap();
 
         Ok(match self.at_origin {
             true => {
                 self.at_origin = false;
-                WorkSchedule::Unit(vec![RawBlockPayload::Genesis])
+                WorkSchedule::Unit(RawBlockPayload::Genesis)
             }
             false => match peer.chainsync().has_agency() {
                 true => match peer.chainsync().request_next().await.or_restart() {
                     Ok(next) => match next {
                         NextResponse::RollForward(cbor, t) => {
                             stage.chain_tip.set(t.1 as i64);
-                            stage
-                                .ctx
-                                .block_buffer
-                                .block_mem_add(RawBlockPayload::Forward(cbor.0.clone()));
-
-                            let current_buffer_depth = stage.ctx.block_buffer.block_mem_size();
-
-                            match current_buffer_depth >= self.min_depth {
-                                true => match stage.ctx.block_buffer.block_mem_take_all() {
-                                    Some(blocks) => match blocks.len() > 0 {
-                                        true => WorkSchedule::Unit(blocks),
-                                        false => WorkSchedule::Idle,
-                                    },
-                                    None => WorkSchedule::Idle,
-                                },
-
-                                false => WorkSchedule::Idle,
-                            }
+                            WorkSchedule::Unit(RawBlockPayload::Forward(cbor.0))
                         }
 
                         NextResponse::RollBackward(p, t) => {
-                            let mut blocks = match stage.ctx.block_buffer.block_mem_take_all() {
-                                Some(blocks) => blocks,
-                                None => vec![],
-                            };
+                            let mut blocks: Vec<Vec<u8>> = Default::default();
 
-                            stage.chain_tip.set(t.1 as i64);
+                            stage.ctx.block_buffer.enqueue_rollback_batch(&p);
 
-                            let rollback_count = stage.ctx.block_buffer.enqueue_rollback_batch(&p);
-
-                            loop {
-                                let pop_rollback_block = stage.ctx.block_buffer.rollback_pop();
-
-                                if let Some(last_good_block) =
-                                    stage.ctx.block_buffer.get_block_at_point(&p)
-                                {
-                                    if let Ok(parsed_last_good_block) =
-                                        MultiEraBlock::decode(&last_good_block)
-                                    {
-                                        if let Ok(Some(rollback_cbor)) = pop_rollback_block {
-                                            log::info!("rolling back {}", rollback_count);
-
-                                            blocks.push(RawBlockPayload::Rollback(
-                                                rollback_cbor.clone(),
-                                                (p.clone(), parsed_last_good_block.number()),
-                                            ));
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    break;
-                                }
+                            while let Ok(Some(block)) = stage.ctx.block_buffer.rollback_pop() {
+                                blocks.push(block);
                             }
 
-                            // Todo Check blocks for any blocks that should not be applied due to this specific rollback
-
-                            match blocks.len() > 0 {
-                                true => {
-                                    log::warn!("ROLLING BACKWARD {:?} {}", t, blocks.len());
-                                    WorkSchedule::Unit(blocks)
-                                }
-                                false => WorkSchedule::Idle,
-                            }
+                            WorkSchedule::Unit(RawBlockPayload::Rollback(blocks))
                         }
 
                         NextResponse::Await => WorkSchedule::Idle,
@@ -190,65 +141,25 @@ impl gasket::framework::Worker<Stage> for Worker {
                     Err(_) => WorkSchedule::Idle,
                 },
                 false => match peer.chainsync().recv_while_must_reply().await.or_restart() {
-                    Ok(n) => {
-                        let mut blocks = match stage.ctx.block_buffer.block_mem_take_all() {
-                            Some(blocks) => blocks,
-                            None => vec![],
-                        };
-
-                        match n {
-                            NextResponse::RollForward(cbor, _t) => {
-                                WorkSchedule::Unit(vec![RawBlockPayload::Forward(cbor.0)])
-                            }
-                            NextResponse::RollBackward(p, _t) => {
-                                stage.ctx.block_buffer.enqueue_rollback_batch(&p);
-
-                                loop {
-                                    let pop_rollback_block = stage.ctx.block_buffer.rollback_pop();
-
-                                    if let Some(last_good_block) =
-                                        stage.ctx.block_buffer.get_block_latest()
-                                    {
-                                        if let Ok(parsed_last_good_block) =
-                                            MultiEraBlock::decode(&last_good_block)
-                                        {
-                                            let last_good_point = Point::Specific(
-                                                parsed_last_good_block.slot(),
-                                                parsed_last_good_block.hash().to_vec(),
-                                            );
-
-                                            if let Ok(Some(rollback_cbor)) = pop_rollback_block {
-                                                blocks.push(RawBlockPayload::Rollback(
-                                                    rollback_cbor.clone(),
-                                                    (
-                                                        last_good_point,
-                                                        parsed_last_good_block.number(),
-                                                    ),
-                                                ));
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                    } else {
-                                        if let Ok(Some(rollback_cbor)) = pop_rollback_block {
-                                            blocks.push(RawBlockPayload::Rollback(
-                                                rollback_cbor.clone(),
-                                                (Point::Origin, 0),
-                                            ));
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                match blocks.len() > 0 {
-                                    true => WorkSchedule::Unit(blocks),
-                                    false => WorkSchedule::Idle,
-                                }
-                            }
-                            NextResponse::Await => WorkSchedule::Idle,
+                    Ok(n) => match n {
+                        NextResponse::RollForward(cbor, t) => {
+                            stage.chain_tip.set(t.1 as i64);
+                            WorkSchedule::Unit(RawBlockPayload::Forward(cbor.0))
                         }
-                    }
+                        NextResponse::RollBackward(p, t) => {
+                            stage.chain_tip.set(t.1 as i64);
+                            let mut blocks: Vec<Vec<u8>> = Default::default();
+
+                            stage.ctx.block_buffer.enqueue_rollback_batch(&p);
+
+                            while let Ok(Some(block)) = stage.ctx.block_buffer.rollback_pop() {
+                                blocks.push(block);
+                            }
+
+                            WorkSchedule::Unit(RawBlockPayload::Rollback(blocks))
+                        }
+                        NextResponse::Await => WorkSchedule::Idle,
+                    },
                     Err(_) => {
                         log::info!("ready for next block");
                         WorkSchedule::Idle
@@ -260,45 +171,14 @@ impl gasket::framework::Worker<Stage> for Worker {
 
     async fn execute(
         &mut self,
-        unit: &Vec<RawBlockPayload>,
+        unit: &RawBlockPayload,
         stage: &mut Stage,
     ) -> Result<(), WorkerError> {
-        for raw_block_payload in unit {
-            match raw_block_payload {
-                RawBlockPayload::Forward(block) => {
-                    match !block.is_empty() && MultiEraBlock::decode(&block).unwrap().slot() > 0 {
-                        true => {
-                            stage
-                                .output
-                                .send(gasket::messaging::Message {
-                                    payload: raw_block_payload.clone(),
-                                })
-                                .await
-                        }
-                        false => Ok(()),
-                    }
-                }
-                RawBlockPayload::Rollback(_, _) => {
-                    stage
-                        .output
-                        .send(gasket::messaging::Message {
-                            payload: raw_block_payload.clone(),
-                        })
-                        .await
-                }
-                RawBlockPayload::Genesis => {
-                    stage
-                        .output
-                        .send(gasket::messaging::Message {
-                            payload: raw_block_payload.clone(),
-                        })
-                        .await
-                }
-            }
-            .map_err(|_| WorkerError::Send)?;
-        }
-
-        Ok(())
+        stage
+            .output
+            .send(unit.clone().into())
+            .await
+            .map_err(|_| WorkerError::Send)
     }
 
     async fn teardown(&mut self) -> Result<(), WorkerError> {

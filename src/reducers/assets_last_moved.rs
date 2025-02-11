@@ -5,9 +5,11 @@ use std::sync::Arc;
 use pallas::crypto::hash::Hash;
 use serde::Deserialize;
 
-use crate::model::{CRDTCommand, DecodedBlockAction};
-use crate::pipeline::Context;
-use crate::{crosscut, model};
+use crate::{
+    crosscut,
+    model::{CRDTCommand, DecodedBlockAction},
+    pipeline::Context,
+};
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -17,7 +19,7 @@ pub struct Config {
 
 pub struct Reducer {
     config: Config,
-    output: OutputPort<CRDTCommand>,
+    pub output: OutputPort<CRDTCommand>,
     ctx: Arc<Context>,
 }
 
@@ -33,7 +35,7 @@ impl Reducer {
             None => "policy".to_string(),
         };
 
-        model::CRDTCommand::HashSetValue(
+        CRDTCommand::HashSetValue(
             format!("{}.{}", key, hex::encode(policy)),
             fingerprint.to_string(),
             timestamp.to_string().into(),
@@ -64,15 +66,20 @@ impl Reducer {
                                 {
                                     let fingerprint_str = fingerprint.finger_print().unwrap();
 
-                                    self.output.send(
-                                        self.process_asset(
-                                            &asset.policy(),
-                                            &fingerprint_str,
-                                            &time_provider.slot_to_wallclock(b.slot()).to_string(),
+                                    self.output
+                                        .send(
+                                            self.process_asset(
+                                                &asset.policy(),
+                                                &fingerprint_str,
+                                                &time_provider
+                                                    .slot_to_wallclock(b.slot())
+                                                    .to_string(),
+                                            )
+                                            .await
+                                            .into(),
                                         )
                                         .await
-                                        .into(),
-                                    );
+                                        .map_err(crate::Error::reducer)?;
                                 }
                             }
                         }

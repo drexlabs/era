@@ -1,6 +1,8 @@
 use futures::future::join_all;
+use gasket::messaging::tokio::funnel_ports;
 use gasket::runtime::{Policy, Tether};
-use log::warn;
+use pallas::crypto::hash::Hash;
+use pallas::ledger::traverse::Era;
 use std::sync::Arc;
 
 use async_trait;
@@ -9,7 +11,7 @@ use pallas::network::miniprotocols::Point;
 use serde::Deserialize;
 
 use crate::model::{CRDTCommand, DecodedBlockAction, EnrichedBlockPayload};
-use crate::pipeline::Context;
+use crate::pipeline::{Context, GASKET_CAP};
 
 use super::Reducer;
 
@@ -19,16 +21,33 @@ use gasket::framework::*;
 pub struct Config(Vec<crate::reducers::Config>);
 
 impl Config {
-    pub fn bootstrapper<'a>(self, ctx: Arc<Context>) -> Bootstrapper {
+    pub fn bootstrapper<'a>(
+        self,
+        ctx: Arc<Context>,
+        input: &mut InputPort<CRDTCommand>,
+    ) -> Bootstrapper {
         let mut reducers: Vec<Reducer> = Default::default();
+        let mut reducer_outputs: Vec<&mut OutputPort<CRDTCommand>> = Default::default();
+
         for reducer_config in self.0 {
-            reducers.push(reducer_config.bootstrapper(Arc::clone(&ctx)));
+            let r = reducer_config.bootstrapper(Arc::clone(&ctx));
+            reducers.push(r);
         }
+
+        for reducer in &mut reducers {
+            reducer_outputs.push(reducer.borrow_output_port());
+        }
+
+        let mut output: OutputPort<CRDTCommand> = Default::default();
+
+        reducer_outputs.push(&mut output);
+
+        funnel_ports(reducer_outputs, input, GASKET_CAP);
 
         Bootstrapper {
             stage: Stage {
                 reducers,
-                output: Default::default(),
+                output,
                 input: Default::default(),
                 ops_count: Default::default(),
                 reducer_errors: Default::default(),
@@ -99,88 +118,62 @@ impl gasket::framework::Worker<Stage> for Worker {
         unit: &EnrichedBlockPayload,
         stage: &mut Stage,
     ) -> Result<(), WorkerError> {
-        let point: Option<Point>;
+        let mut raw_block: Option<Vec<u8>> = None;
 
-        match unit {
-            EnrichedBlockPayload::Genesis(genesis_utxo) => {
-                if let Some((byron_last_hash, _, _)) = genesis_utxo.last() {
-                    point = Some(Point::Specific(0, byron_last_hash.to_vec()));
-                }
+        let reducer_block: Arc<DecodedBlockAction> = Arc::new(unit.into());
 
-                stage
-                    .output
-                    .send(
-                        CRDTCommand::block_starting(
-                            None,
-                            Some(&pallas::crypto::hash::Hash::new([0; 32])),
-                        )
-                        .into(),
-                    )
-                    .await
-                    .map_err(|r| WorkerError::Send)
-            }
+        let worker_orchestrator_block_ref = reducer_block.as_ref();
 
-            action @ (EnrichedBlockPayload::Forward(raw, block_context, last_good)
-            | EnrichedBlockPayload::Rollback(raw, block_context, last_good)) => {
-                match action.decode_block() {
-                    Some(parsed_block) => {
-                        let rollback = match action {
-                            EnrichedBlockPayload::Rollback(_, _, _) => true,
-                            _ => false,
-                        };
+        stage
+            .output
+            .send(CRDTCommand::block_starting(worker_orchestrator_block_ref).into())
+            .await
+            .map_err(|_| WorkerError::Send)?;
 
-                        let reducer_block_ac: Arc<DecodedBlockAction> = Arc::new(action.into());
-                        let parsed_block = Arc::new(parsed_block);
+        if worker_orchestrator_block_ref.parsed_block().is_some()
+            && worker_orchestrator_block_ref
+                .parsed_block()
+                .unwrap()
+                .tx_count()
+                > 0
+        {
+            let reducer_futures = stage
+                .reducers
+                .iter_mut()
+                .map(|reducer| {
+                    let reducer_block = Arc::clone(&reducer_block);
+                    reducer.reduce_block(reducer_block)
+                })
+                .collect::<Vec<_>>();
 
-                        {
-                            stage
-                                .output
-                                .send(
-                                    CRDTCommand::block_starting(Some(parsed_block.as_ref()), None)
-                                        .into(),
-                                )
-                                .await
-                                .map_err(|_| WorkerError::Send)?;
-                        }
-
-                        let reducer_futures = stage
-                            .reducers
-                            .iter_mut()
-                            .map(|reducer| {
-                                let reducer_block = Arc::clone(&reducer_block_ac);
-                                reducer.reduce_block(reducer_block)
-                            })
-                            .collect::<Vec<_>>();
-
-                        join_all(reducer_futures)
-                            .await
-                            .into_iter()
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(|e| {
-                                warn!("the big one {:?}", e);
-                                WorkerError::Panic
-                            })?;
-
-                        stage
-                            .output
-                            .send(
-                                CRDTCommand::block_finished(
-                                    Point::new(parsed_block.slot(), parsed_block.hash().to_vec()), // todo: confirm this is the correct point
-                                    raw.clone(),
-                                    parsed_block.era() as i64,
-                                    parsed_block.tx_count() as u64,
-                                    parsed_block.number() as i64,
-                                    rollback,
-                                )
-                                .into(),
-                            )
-                            .await
-                            .map_err(|_| WorkerError::Send)
-                    }
-
-                    None => Err(WorkerError::Panic),
-                }
-            }
+            join_all(reducer_futures)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .or_panic()?;
         }
+
+        stage
+            .output
+            .send(
+                CRDTCommand::block_finished(
+                    worker_orchestrator_block_ref.block_rolling_to_point(),
+                    raw_block,
+                    worker_orchestrator_block_ref.block_era() as i64,
+                    worker_orchestrator_block_ref.block_tx_count() as u64,
+                    worker_orchestrator_block_ref.block_number(),
+                    match unit {
+                        EnrichedBlockPayload::Rollback(_, _, _) => true,
+                        _ => false,
+                    },
+                    match unit {
+                        EnrichedBlockPayload::Genesis(_) => true,
+                        _ => false,
+                    },
+                )
+                .into(),
+            )
+            .await
+            .map_err(|_| WorkerError::Send)
     }
 }

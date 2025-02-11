@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use pallas::network::miniprotocols::Point;
 use serde::Deserialize;
-use tokio::sync::Mutex;
 
 use crate::{pipeline, storage::Cursor};
 
@@ -44,6 +43,7 @@ impl Config {
             //last_block: Default::default(),
             cursor,
             historic_blocks_removed: Default::default(),
+            blocks_ingested: Default::default(),
         }
     }
 }

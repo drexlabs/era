@@ -3,9 +3,11 @@ use std::sync::Arc;
 use gasket::framework::*;
 
 use gasket::messaging::{InputPort, OutputPort};
+use log::warn;
 use pallas::ledger::configs::byron::{genesis_utxos, GenesisUtxo};
 
 use pallas::ledger::traverse::MultiEraOutput;
+use pallas::network::miniprotocols::Point;
 use pallas::{
     codec::minicbor,
     ledger::traverse::{Era, MultiEraBlock, MultiEraTx, OutputRef},
@@ -124,16 +126,22 @@ impl Worker {
         inserts: &gasket::metrics::Counter,
     ) -> Result<(), crate::Error> {
         let mut insert_batch = sled::Batch::default();
+        let mut amt = 0;
 
         for tx in txs.iter() {
             for (idx, output) in tx.produces() {
                 let value: IVec = SledTxValue(tx.era() as u16, output.encode()).try_into()?;
                 insert_batch.insert(format!("{}#{}", tx.hash(), idx).as_bytes(), value);
-                inserts.inc(1);
+                amt += 1;
             }
         }
 
-        db.apply_batch(insert_batch).map_err(crate::Error::storage)
+        db.apply_batch(insert_batch)
+            .map_err(crate::Error::storage)?;
+
+        inserts.inc(amt);
+
+        Ok(())
     }
 
     fn insert_genesis_utxo(
@@ -171,16 +179,22 @@ impl Worker {
         enrich_removes: &gasket::metrics::Counter,
     ) -> Result<(), crate::Error> {
         let mut remove_batch = sled::Batch::default();
+        let mut amt = 0;
 
         for tx in txs.iter() {
             for (idx, _) in tx.produces() {
-                enrich_removes.inc(txs.len() as u64);
+                amt += txs.len() as u64;
 
                 remove_batch.remove(format!("{}#{}", tx.hash(), idx).as_bytes());
             }
         }
 
-        db.apply_batch(remove_batch).map_err(crate::Error::storage)
+        db.apply_batch(remove_batch)
+            .map_err(crate::Error::storage)?;
+
+        enrich_removes.inc(amt);
+
+        Ok(())
     }
 
     #[inline]
@@ -449,44 +463,58 @@ impl gasket::framework::Worker<Stage> for Worker {
                             .or_panic()
                     }
 
-                    model::RawBlockPayload::Rollback(
-                        cbor,
-                        (last_known_point, last_known_block_number),
-                    ) => {
-                        log::warn!("rolling back");
+                    model::RawBlockPayload::Rollback(blocks) => {
+                        log::warn!("rolling back in enrich {:?}", blocks);
 
-                        let block = MultiEraBlock::decode(&cbor);
+                        for (i, raw_block) in blocks.iter().enumerate() {
+                            let next_block_for_rollback = blocks.get(i + 1);
 
-                        if let Ok(block) = block {
-                            let txs = block.txs();
+                            match MultiEraBlock::decode(&raw_block) {
+                                Ok(block) => {
+                                    let txs = block.txs();
 
-                            self.replace_consumed_utxos(db, consumed_ring, &txs)
-                                .or_panic()?;
+                                    self.replace_consumed_utxos(db, consumed_ring, &txs)
+                                        .or_panic()?;
 
-                            let (ctx, match_count, mismatch_count) = self
-                                .par_fetch_referenced_utxos(
-                                    db,
-                                    last_known_block_number.clone(),
-                                    &txs,
-                                );
+                                    let (ctx, match_count, mismatch_count) =
+                                        self.par_fetch_referenced_utxos(db, block.number(), &txs); // todo: RED FLAG .. NEED TO THINK THRU THE BLOCK NUMBER HERE AND RELATED STUFF
 
-                            stage.enrich_matches.inc(match_count);
-                            stage.enrich_mismatches.inc(mismatch_count);
+                                    stage.enrich_matches.inc(match_count);
+                                    stage.enrich_mismatches.inc(mismatch_count);
 
-                            // Revert Anything to do with this block from consumed ring
-                            self.remove_produced_utxos(db, &txs, &stage.enrich_removes)
-                                .map_err(crate::Error::storage)
-                                .or_panic()?;
+                                    // Revert Anything to do with this block from consumed ring
+                                    self.remove_produced_utxos(db, &txs, &stage.enrich_removes)
+                                        .map_err(crate::Error::storage)
+                                        .or_panic()?;
 
-                            stage
-                                .output
-                                .send(model::EnrichedBlockPayload::rollback(
-                                    cbor.clone(),
-                                    ctx,
-                                    (last_known_point.clone(), last_known_block_number.clone()),
-                                ))
-                                .await
-                                .or_panic()?;
+                                    let latest_block =
+                                        stage.ctx.block_buffer.get_block_latest().unwrap();
+
+                                    let multi_era_latest = MultiEraBlock::decode(
+                                        next_block_for_rollback.unwrap_or(&latest_block),
+                                    )
+                                    .unwrap();
+
+                                    // Could probably delete rolled back blocks from buffer, but also probably doesn't matter
+                                    stage
+                                        .output
+                                        .send(
+                                            model::EnrichedBlockPayload::rollback(
+                                                raw_block.clone(),
+                                                ctx,
+                                                Point::Specific(
+                                                    multi_era_latest.slot(),
+                                                    multi_era_latest.hash().to_vec(),
+                                                ),
+                                            )
+                                            .into(),
+                                        )
+                                        .await
+                                        .or_panic()
+                                }
+
+                                Err(_) => Err(WorkerError::Panic),
+                            }?;
                         }
 
                         stage.enrich_blocks.inc(1);

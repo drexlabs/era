@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use pallas::network::miniprotocols::Point;
 use serde::Deserialize;
-use tokio::sync::Mutex;
 
 use crate::{pipeline, storage::Cursor};
 

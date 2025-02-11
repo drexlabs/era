@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
-use futures::lock::Mutex;
 use gasket::messaging::OutputPort;
 use pallas::codec::utils::KeyValuePairs;
 use pallas::ledger::primitives::alonzo::{Metadatum, MetadatumLabel};
-use pallas::ledger::traverse::MultiEraBlock;
 
 use pallas_bech32::cip14::AssetFingerprint;
 use serde::Deserialize;
@@ -24,7 +22,7 @@ pub struct Config {
 pub struct Reducer {
     config: Config,
     ctx: Arc<Context>,
-    output: OutputPort<CRDTCommand>,
+    pub output: OutputPort<CRDTCommand>,
 }
 
 const CIP25_META_NFT: u64 = 721;

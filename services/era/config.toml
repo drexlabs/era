@@ -1,3 +1,6 @@
+[pipeline]
+args = "Plain"
+
 [bootstrap_retry]
 max_retries = 100
 backoff_unit_sec = 1
@@ -43,22 +46,22 @@ royalty_key_prefix = "m.r"
 [[reducers]]
 type = "AssetsBalances"
 
-# [[reducers]]
-# type = "Handle"
-# key_prefix = "h"
-# policy_id = "f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a"
+[[reducers]]
+type = "Handle"
+key_prefix = "h"
+policy_id = "f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a"
 
-# [[reducers]]
-# type = "AssetsLastMoved"
-# key_prefix = "p"
+[[reducers]]
+type = "AssetsLastMoved"
+key_prefix = "p"
 
-# [[reducers]]
-# type = "Parameters"
-# key_prefix = "pr"
+[[reducers]]
+type = "Parameters"
+key_prefix = "pr"
 
-# [[reducers]]
-# type = "StakeToPool"
-# key_prefix = "pl"
+[[reducers]]
+type = "StakeToPool"
+key_prefix = "pl"
 
 [intersect]
 type = "Origin"

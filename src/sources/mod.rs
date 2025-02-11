@@ -1,16 +1,11 @@
 use std::sync::Arc;
 
-use crate::{
-    model,
-    pipeline::{self, Context},
-    storage::Cursor,
-};
+use crate::{model, pipeline::Context, storage::Cursor};
 use gasket::{
     messaging::OutputPort,
     runtime::{Policy, Tether},
 };
 use serde::Deserialize;
-use tokio::sync::Mutex;
 
 pub mod utils;
 
