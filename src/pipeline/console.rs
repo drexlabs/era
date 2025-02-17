@@ -1,6 +1,7 @@
 use chrono::Duration as ChronoDuration;
 use chrono::{DateTime, Utc};
-use gasket::framework::{AsWorkError, WorkSchedule};
+use crossterm::execute;
+use gasket::framework::{AsWorkError, WorkSchedule}; 
 use gasket::messaging::{InputPort, OutputPort};
 use gasket::runtime::Policy;
 use gasket::{
@@ -8,24 +9,24 @@ use gasket::{
     metrics::Reading,
     runtime::{StagePhase, TetherState},
 };
+use gasket_log::model::Log;
+use gasket_log::warn;
 use lazy_static::lazy_static;
-use log::{warn, Log};
 use ratatui::prelude::Layout;
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Padding};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{Mutex, MutexGuard};
 
 use crate::crosscut;
 
-use crate::model::{MeteredNumber, MeteredString, MeteredValue, MetricsSnapshot, ProgramOutput};
+use crate::model::{merge_metrics_snapshots, MeteredNumber, MeteredString, MeteredValue, MetricsSnapshot};
 
 use super::{Context, Pipeline, StageTypes};
 
 use crossterm::{
-    event::{self, KeyCode, KeyEventKind},
+    event::{self, KeyCode, KeyEventKind}, 
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -56,7 +57,7 @@ impl FrameState {
         if self.frame_times.len() >= self.sample_window {
             self.frame_times.pop_front();
         }
-        self.frame_times.push_back(frame_time);
+        self.frame_times.push_back(frame_time); 
 
         self.last_frame = now;
     }
@@ -100,7 +101,7 @@ impl Bootstrapper {
         &mut self.stage.output
     }
 
-    pub fn borrow_input_port(&mut self) -> &'_ mut InputPort<ProgramOutput> {
+    pub fn borrow_input_port(&mut self) -> &'_ mut InputPort<Vec<Log>> {
         &mut self.stage.input
     }
 
@@ -131,7 +132,7 @@ impl Config {
             frames_rendered: Default::default(),
             frame_time: Default::default(),
             metrics_snapshot_totality: Default::default(),
-            visual_log_buffer: LogBuffer::new(100),
+            visual_log_buffer: Default::default(),
             ctx,
         };
 
@@ -150,10 +151,10 @@ impl ConsoleWorker {
         &mut self,
         ctx: Arc<Context>,
         snapshot: &MetricsSnapshot,
-        visual_log_buffer: &LogBuffer,
+        visual_log_buffer: &VecDeque<Log>,
     ) {
         
-        let current_era = snapshot.chain_era.clone().unwrap().get_string(); 
+        let current_era = snapshot.chain_era.clone().unwrap().get_string();
 
         let provider = crosscut::time::NaiveProvider::new(ctx).await;
         let wallclock = provider.slot_to_wallclock(snapshot.chain_bar_progress.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num());
@@ -178,9 +179,15 @@ impl ConsoleWorker {
                         Constraint::Length(2),
                     ])
                     .split(frame.size());
+
+        let calc = if layout[1].height as usize >= 2 {
+            layout[1].height as usize - 2
+        } else {
+            0
+        };
         
-        for entry in visual_log_buffer.peek_all().await.iter().rev().take(layout[1].height as usize - 2) {
-            log_buffer_string += &format!("{} {}\n", entry.0, entry.1);
+        for entry in visual_log_buffer.iter().rev().take(calc) {
+            log_buffer_string += &entry.to_string();
         }
 
         self.terminal
@@ -502,7 +509,7 @@ impl ConsoleWorker {
                         .block(Block::default().style(Style::default().fg(Color::Blue)))
                         .alignment(Alignment::Right),
                     chart_blocks_axis[1],
-                );
+                ); 
                 
                 frame.render_widget(
                     Paragraph::new(format!("{}┈", chain_bar_min_s))
@@ -658,14 +665,14 @@ impl ConsoleWorker {
 }
 
 #[derive(gasket::framework::Stage)]
-#[stage(name = "console-renderer", unit = "ProgramOutput", worker = "ConsoleWorker")]
+#[stage(name = "console-renderer", unit = "()", worker = "ConsoleWorker")]
 pub struct Stage {
     pub mode: Mode,
-    pub input: InputPort<ProgramOutput>,
+    pub input: InputPort<Vec<Log>>,
     pub output: OutputPort<()>,
     pub metrics_snapshot_totality: MetricsSnapshot,
     pub ctx: Arc<Context>,
-    pub visual_log_buffer: LogBuffer,
+    pub visual_log_buffer: VecDeque<Log>,
 
     #[metric]
     frames_rendered: gasket::metrics::Counter,
@@ -673,17 +680,13 @@ pub struct Stage {
     frame_time: gasket::metrics::Gauge,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait(?Send)] 
 impl gasket::framework::Worker<Stage> for ConsoleWorker {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
-        initialize_logging().await;
-
         if let Mode::TUI = stage.mode {
             stdout().execute(EnterAlternateScreen).unwrap();
-            enable_raw_mode().unwrap();
+            enable_raw_mode().unwrap(); 
         }
-        
-        //warn!("entering console mode");
         
         Ok(Self {
             metrics_buffer: BlockGraph::new(RING_DEPTH),
@@ -692,9 +695,7 @@ impl gasket::framework::Worker<Stage> for ConsoleWorker {
         })
     }
 
-    async fn schedule(&mut self, stage: &mut Stage) -> Result<WorkSchedule<ProgramOutput>, WorkerError> {
-        self.terminal.flush().unwrap();
-        
+    async fn schedule(&mut self, stage: &mut Stage) -> Result<WorkSchedule<()>, WorkerError> {        
         match stage
             .input
             .recv()
@@ -702,125 +703,44 @@ impl gasket::framework::Worker<Stage> for ConsoleWorker {
             .map_err(|_| WorkerError::Recv)
             .map(|u| u.payload)
         {
-            Ok(program_output) => {
-                if self.frame_state.should_render() {
-                    Ok(WorkSchedule::Unit(program_output))
-                } else {
-                    if let ProgramOutput::LogBatch(log_batch) = program_output {
-                        let mut cloned_buffer: Vec<(String, String)>;
-                        {
-                            let mut buffer_ref = LOG_BUFFER.vec.lock().await;
-                            cloned_buffer = buffer_ref.drain(..).collect();
-                        }
-                        
-                        for item in log_batch {
-                            cloned_buffer.push(item.clone());
-                        }
-                        
-                        Ok(WorkSchedule::Unit(ProgramOutput::LogBatch(cloned_buffer)))
-                    } else {
-                        Ok(WorkSchedule::Idle)
+            Ok(logs) => {
+                for item in logs {
+                    stage.visual_log_buffer.push_back(item);
+                    if stage.visual_log_buffer.len() > RING_DEPTH {
+                        stage.visual_log_buffer.pop_front();
                     }
-                   
                 }
+                
+                //stage.metrics_snapshot_totality = merge_metrics_snapshots(&[stage.metrics_snapshot_totality.clone(), metrics_snapshot]); todo: bring tui metrics back in -- we need to be able to wrap the log output easily
+
+                if self.frame_state.should_render() {
+                    Ok(WorkSchedule::Unit(()))
+                } else {
+                    Ok(WorkSchedule::Idle)
+                }
+                
             }
             Err(_) => Err(WorkerError::Retry),
         }
     }
 
-    async fn execute(&mut self, unit: &ProgramOutput, stage: &mut Stage) -> Result<(), WorkerError> {
+    async fn execute(&mut self, _unit: &(), stage: &mut Stage) -> Result<(), WorkerError> {
         let start = Instant::now();
-
-        let unit = match unit.clone() {
-            ProgramOutput::LogBatch(b) => {
-                let mut result = b.clone();
-                result.extend(LOG_BUFFER.vec.lock().await.drain(..));
-                ProgramOutput::LogBatch(result)
-            },
-
-            o => o,
-        };
         
         match stage.mode {
             Mode::TUI => {
-                stage.metrics_snapshot_totality.merge(match &unit { // todo.. there are two fns used that do this same merge.. pick one and use everywhere
-                    ProgramOutput::LogBatch(_) => {
-                        &MetricsSnapshot {
-                            timestamp: None,
-                            chain_bar_depth: None,
-                            chain_bar_progress: None,
-                            blocks_processed: None,
-                            transactions: None,
-                            chain_era: None,
-                            sources_status: None,
-                            enrich_status: None,
-                            reducer_status: None,
-                            storage_status: None,
-                            enrich_hit: None,
-                            enrich_miss: None,
-                            blocks_ingested: None,
-                        }
-                    },
-
-                    ProgramOutput::Metrics(snapshot) => snapshot,
-                });
-
-                if let ProgramOutput::LogBatch(logs) = unit {
-                    for log in logs.clone() {
-                        stage.visual_log_buffer.push(log).await;
-                    }
-                }
-                
                 self.draw(Arc::clone(&stage.ctx), &stage.metrics_snapshot_totality, &stage.visual_log_buffer)
                     .await;
 
                 self.metrics_buffer.push(stage.metrics_snapshot_totality.clone());
             }
-            Mode::Plain => {match &unit {
-                ProgramOutput::LogBatch(batch) => {
-                    for log in batch {
-                        stage.visual_log_buffer.push(log.clone()).await;
-                    }
-                }
+            Mode::Plain => {
+                // Plain console logic 
+                let terminal = self.terminal.backend_mut();
+                    for log in &stage.visual_log_buffer {
+                        execute!(terminal, crossterm::style::Print(log.to_string() + "\r\n"));
+                    };
 
-                ProgramOutput::Metrics(_) => {}
-            }
-
-                let cloned_visual_log_buffer = {stage.visual_log_buffer.vec.lock().await.clone()};
-
-                
-                // Plain console logic
-                self.terminal.draw(|frame| {
-                    // Get the total terminal height
-                    let area = frame.size();
-                    
-                    // Create a layout that pushes your content to the bottom
-                    // This example reserves 3 lines at the bottom
-                    let chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Min(0),         // This takes up all extra space
-                            Constraint::Length(3),      // Your app gets 3 lines
-                        ])
-                        .split(area);
-
-
-                    let sub = (String::from("Mike"), String::from("Mike"));
-                    
-                    let stub0 = cloned_visual_log_buffer.get(0).unwrap_or(&sub);
-                    let stub1 = cloned_visual_log_buffer.get(1).unwrap_or(&sub);
-                    let stub2 = cloned_visual_log_buffer.get(2).unwrap_or(&sub);
-                    
-                    let a = format!("{}\n{}\n{}", stub0.0, stub1.0, stub2.0);
-                    
-                    // Render your content in the bottom chunk
-                    let content = Paragraph::new(a)
-                        .block(Block::default()
-                            .borders(Borders::ALL)
-                            .title("Mini App"));
-                    
-                    frame.render_widget(content, chunks[1]);  // Use chunks[1] for the bottom section
-                }).or_retry()?;
             }
         };
 
@@ -1072,119 +992,3 @@ pub fn i64_to_string(mut i: i64) -> String {
 }
 
 const RING_DEPTH: usize = 100;
-
-struct BufferedLogger {
-    output: Arc<Mutex<OutputPort<ProgramOutput>>>,
-    runtime: tokio::runtime::Runtime,
-}
-
-// impl Deref for TuiConsole {
-//     type Target = Terminal<CrosstermBackend<std::io::Stdout>>;
-
-//     fn deref(&self) -> &Self::Target {
-//         &self.terminal
-//     }
-// }
-
-// impl DerefMut for TuiConsole {
-//     fn deref_mut(&mut self) -> &mut Self::Target {
-//         &mut self.terminal
-//     }
-// }
-
-impl BufferedLogger {
-    fn new() -> Self {
-        Self {
-            output: Default::default(),
-            runtime: tokio::runtime::Runtime::new().unwrap(),
-        }
-    }
-
-    pub fn borrow_output_port(&self) -> MutexGuard<OutputPort<ProgramOutput>> {
-        self.output.blocking_lock() 
-    }
-
-    fn batch_logs_out(&self) {
-        let batch = {
-            let mut guard = LOG_BUFFER.vec.blocking_lock();
-            if guard.len() > 0 {
-                std::mem::replace(&mut *guard, Default::default())
-            } else {
-                Default::default()
-            }
-        };
-        
-        self.runtime.block_on(self.borrow_output_port().send(gasket::messaging::Message::from(ProgramOutput::LogBatch(batch)))).unwrap();
-    }
-
-}
-
-impl log::Log for BufferedLogger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() >= log::Level::Info
-    }
-
-    fn log(&self, record: &log::Record) {
-        let r = record.clone();
-        let s = (r.level().to_string(), r.args().to_string());
-
-        tokio::task::spawn(async move {
-            let mut buffer = LOG_BUFFER.vec.lock().await;
-            if buffer.len() == LOG_BUFFER.capacity {
-                buffer.remove(0);
-            }
-            buffer.push(s);
-        });
-    }
-
-    fn flush(&self) {
-        self.batch_logs_out();
-    }
-}
-
-async fn initialize_logging() {
-    log::set_boxed_logger(Box::new(BufferedLogger::new()))
-        .map(|_| log::set_max_level(log::LevelFilter::Info))
-        .unwrap();
-}
-
-struct LogBuffer {
-    vec: Arc<Mutex<Vec<(String, String)>>>,
-    capacity: usize,
-}
-
-impl LogBuffer {
-    pub fn new(capacity: usize) -> Self {
-        //let base_time = Instant::now();
-
-        Self {
-            vec: Arc::new(Mutex::new(vec![])),
-            capacity,
-        }
-    }
-
-    pub async fn push(&mut self, ele: (String, String)) {
-        let mut v = self.vec.lock().await;
-        if v.len() == self.capacity {
-            v.remove(0);
-        }
-
-        v.push(ele.clone());
-    }
-
-    pub async fn peek_all(&self) -> Vec<(String, String)> {
-        self.vec.lock().await.clone()
-    }
-
-    pub async fn take_all(&self) -> Vec<(String, String)> {
-        self.vec.lock().await.drain(..).collect()
-    }
-}
-
-lazy_static! {
-    static ref CONSOLE_MOCK_STAGE: Mutex<BufferedLogger> = Mutex::new(BufferedLogger::new());
-}
-
-lazy_static! {
-    static ref LOG_BUFFER: LogBuffer = LogBuffer::new(100);
-}

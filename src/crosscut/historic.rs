@@ -1,5 +1,6 @@
 use crate::{model::RawBlockPayload, Error};
 use crossbeam_queue::SegQueue;
+use gasket_log::info;
 use pallas::network::miniprotocols::Point;
 use serde::{Deserialize, Serialize};
 use sled::IVec;
@@ -57,12 +58,12 @@ impl BufferBlocks {
         let db_path = config.clone().db_path;
 
         if let Err(_) = create_dir_all(&db_path) {
-            log::info!("sled: database already exists ({})", db_path);
+            info!("sled: database already exists ({})", db_path);
         } else {
-            log::info!("sled: database being created ({})", db_path);
+            info!("sled: database being created ({})", db_path);
         }
 
-        log::info!("sled: opening database ({})", db_path);
+        info!("sled: opening database ({})", db_path);
 
         let db = sled::Config::default()
             .path(db_path)
@@ -72,7 +73,7 @@ impl BufferBlocks {
             .open()
             .unwrap();
 
-        log::info!("sled: block buffer db opened");
+        info!("sled: block buffer db opened");
 
         BufferBlocks {
             config,

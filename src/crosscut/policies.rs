@@ -1,3 +1,4 @@
+use gasket_log::warn;
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
@@ -29,7 +30,7 @@ fn handle_error<T>(err: Error, action: &Option<ErrorAction>) -> Result<Option<T>
     match action {
         Some(ErrorAction::Skip) => Ok(None),
         Some(ErrorAction::Warn) => {
-            log::warn!("{}", err);
+            warn!("{}", err);
             Ok(None)
         }
         _ => Err(err),

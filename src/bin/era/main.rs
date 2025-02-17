@@ -1,5 +1,4 @@
 use clap::Parser;
-use log::warn;
 use std::process;
 
 mod daemon;
@@ -22,13 +21,13 @@ async fn main() {
                 pipeline_tether.join_stage();
             }
 
-            Err(err) => {
+            Err(_) => {
                 process::exit(1);
             }
         },
     };
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100000)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100000)).await; // todo: remove, obv
 
     // todo: keyboard interrupt
 }

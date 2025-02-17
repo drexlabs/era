@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use futures::TryFutureExt;
 use gasket::messaging::OutputPort;
+use gasket_log::{info, warn};
 use pallas::ledger::configs::byron::genesis_utxos;
 use pallas::ledger::traverse::MultiEraBlock;
 use pallas::network::facades::NodeClient;
@@ -40,7 +41,7 @@ impl gasket::framework::Worker<Stage> for Worker {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
         let ctx = Arc::clone(&stage.ctx);
 
-        log::warn!(
+        warn!(
             "pipeline: attempting to connect to the network {}",
             stage.name()
         );
@@ -59,7 +60,7 @@ impl gasket::framework::Worker<Stage> for Worker {
 
         match stage.cursor.clone().last_point().unwrap() {
             Some(x) => {
-                log::info!("found existing cursor in storage plugin: {:?}", x);
+                info!("found existing cursor in storage plugin: {:?}", x);
                 let point: Point = x.try_into().unwrap();
                 //stage.last_block.set(point.slot_or_default() as i64);
                 peer.chainsync()
@@ -161,7 +162,7 @@ impl gasket::framework::Worker<Stage> for Worker {
                         NextResponse::Await => WorkSchedule::Idle,
                     },
                     Err(_) => {
-                        log::info!("ready for next block");
+                        info!("ready for next block");
                         WorkSchedule::Idle
                     }
                 },

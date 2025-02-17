@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use gasket::messaging::OutputPort;
+use gasket_log::warn;
 use pallas::ledger::addresses::{Address, StakeAddress};
 use serde::Deserialize;
 
@@ -121,7 +122,7 @@ impl Reducer {
                                 for asset in asset_list.assets() {
                                     match String::from_utf8(asset.name().to_vec()) {
                                         Ok(asset_name) => asset_names.push(asset_name),
-                                        Err(_) => log::warn!(
+                                        Err(_) => warn!(
                                             "could not parse asset name {:?} not a valid ada handle?",
                                             asset.name().to_ascii_lowercase(),
                                         ),

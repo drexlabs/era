@@ -1,5 +1,6 @@
 use std::convert::TryInto;
 
+use gasket_log::info;
 use pallas::{
     codec::Fragment,
     network::miniprotocols::{chainsync, Point},
@@ -15,7 +16,7 @@ pub async fn define_chainsync_start<C: Fragment>(
 ) -> Result<Option<Point>, crate::Error> {
     match cursor.last_point()? {
         Some(x) => {
-            log::info!("found existing cursor in storage plugin: {:?}", x);
+            info!("found existing cursor in storage plugin: {:?}", x);
             let point = x.try_into()?;
             let (point, _) = client
                 .find_intersect(vec![point])
@@ -23,7 +24,7 @@ pub async fn define_chainsync_start<C: Fragment>(
                 .map_err(crate::Error::ouroboros)?;
             return Ok(point);
         }
-        None => log::info!("no cursor found in storage plugin"),
+        None => info!("no cursor found in storage plugin"),
     };
 
     match &intersect {

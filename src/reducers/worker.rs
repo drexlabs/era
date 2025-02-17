@@ -118,7 +118,7 @@ impl gasket::framework::Worker<Stage> for Worker {
         unit: &EnrichedBlockPayload,
         stage: &mut Stage,
     ) -> Result<(), WorkerError> {
-        let mut raw_block: Option<Vec<u8>> = None;
+        let raw_block: Option<Vec<u8>> = None;
 
         let reducer_block: Arc<DecodedBlockAction> = Arc::new(unit.into());
 

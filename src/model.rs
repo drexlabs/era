@@ -7,6 +7,7 @@ use std::convert::Into;
 
 use gasket::metrics::Readings;
 use gasket::runtime::{Policy, TetherState};
+use gasket_log::{debug, info};
 use pallas::crypto::hash::Hash;
 use pallas::ledger::configs::byron::{from_file, GenesisUtxo};
 use pallas::{
@@ -37,6 +38,7 @@ pub struct ConfigRoot {
     pub teardown_retry: Option<gasket::retries::Policy>,
     pub display: Option<crate::pipeline::console::Config>,
     pub pipeline: Option<crate::pipeline::Config>,
+    pub logging: Option<gasket_log::Config>,
 }
 
 impl ConfigRoot {
@@ -82,7 +84,7 @@ impl ConfigRoot {
             .take()
             .unwrap_or(format!("assets/{}-byron-genesis.json", chaintag,));
 
-        log::info!("making context: with genesis ({})", genesis_path);
+        info!("making context: with genesis ({})", genesis_path);
 
         Arc::new(Context {
             chain: chain.into(),
@@ -230,12 +232,6 @@ impl MeteredValue {
             MeteredValue::Label(metered_string) => metered_string.value.clone(),
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub enum ProgramOutput {
-    LogBatch(Vec<(String, String)>),
-    Metrics(MetricsSnapshot),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -745,7 +741,7 @@ impl CRDTCommand {
         is_rollback: bool,
         is_genesis: bool,
     ) -> CRDTCommand {
-        log::debug!("block finished {:?}", point);
+        debug!("block finished {:?}", point);
         CRDTCommand::BlockFinished(
             point,
             block_bytes,

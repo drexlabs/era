@@ -6,9 +6,7 @@ use std::sync::Arc;
 
 use crate::{crosscut, model::ConfigRoot};
 
-use crate::model::{
-    merge_metrics_snapshots, MeteredValue, MetricsSnapshot, ProgramOutput, TetherSnapshot,
-};
+use crate::model::{merge_metrics_snapshots, MeteredValue, MetricsSnapshot, TetherSnapshot};
 use console::Mode;
 use futures::TryFutureExt;
 use gasket::messaging::tokio::funnel_ports;
@@ -19,7 +17,7 @@ use gasket::{
     messaging::tokio::connect_ports,
     runtime::{Policy, StagePhase, Tether, TetherState},
 };
-use log::warn;
+use gasket_log::warn;
 use pallas::ledger::{configs::byron::GenesisFile, traverse::wellknown::GenesisValues};
 use serde::Deserialize;
 use tokio::time::{sleep, Instant};
@@ -99,7 +97,7 @@ impl Config {
 )]
 pub struct Stage {
     pub config: RefCell<ConfigRoot>,
-    pub output: RefCell<OutputPort<ProgramOutput>>,
+    pub output: RefCell<OutputPort<()>>,
     pub stage_config: Config,
 }
 
@@ -116,12 +114,18 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             ctx: config.take_some_to_make_context(),
         };
 
+        let logs = config.logging.take().unwrap_or_default();
         let output = config.display.take().unwrap_or_default();
-
         let mut output_stage = output.bootstrapper(Arc::clone(&pipe.ctx));
+        let logs_stage = logs.bootstrapper(vec![output_stage.borrow_input_port()]);
+        logs_stage.spawn(pipe.policy.clone());
+
+        pipe.tethers
+            .push(output_stage.spawn_stage(pipe.policy.clone()));
+
+        pipe.wait_for_tethers();
 
         let enrich = config.enrich.take().unwrap_or_default();
-
         let mut enrich_stage = enrich.bootstrapper(Arc::clone(&pipe.ctx));
 
         let mut storage_stage = config
@@ -156,14 +160,11 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             GASKET_CAP,
         );
 
-        funnel_ports(
-            vec![&mut stage.output.borrow_mut()],
-            output_stage.borrow_input_port(),
-            GASKET_CAP,
-        );
-
-        pipe.tethers
-            .push(output_stage.spawn_stage(pipe.policy.clone()));
+        // funnel_ports(
+        //     vec![&mut stage.output.borrow_mut()],
+        //     output_stage.borrow_input_port(),
+        //     GASKET_CAP,
+        // );
 
         pipe.wait_for_tethers();
 
@@ -369,14 +370,14 @@ impl gasket::framework::Worker<Stage> for Pipeline {
         unit: &Vec<MetricsSnapshot>,
         stage: &mut Stage,
     ) -> Result<(), WorkerError> {
-        stage
-            .output
-            .borrow_mut()
-            .send(gasket::messaging::Message {
-                payload: ProgramOutput::Metrics(merge_metrics_snapshots(unit)),
-            })
-            .map_err(|_| WorkerError::Send)
-            .await?;
+        // stage
+        //     .output
+        //     .borrow_mut()
+        //     .send(gasket::messaging::Message {
+        //         payload: ProgramOutput::Metrics(merge_metrics_snapshots(unit)),
+        //     })
+        //     .map_err(|_| WorkerError::Send)
+        //     .await?;
 
         Ok(())
     }
@@ -422,7 +423,7 @@ impl Pipeline {
     pub fn shutdown(self) {
         for tether in self.tethers {
             let state = tether.check_state();
-            log::warn!("dismissing stage: {} with state {:?}", tether.name(), state);
+            warn!("dismissing stage: {} with state {:?}", tether.name(), state);
             tether.dismiss_stage().expect("stage stops");
 
             // Note: Below possibly isn't true anymore due to gasket-rs updates. need to investigate

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use gasket::framework::*;
 
 use gasket::messaging::InputPort;
-use log::warn;
+use gasket_log::{info, warn};
 use redis::{Cmd, Commands, ConnectionLike, ToRedisArgs};
 use serde::Deserialize;
 
@@ -129,7 +129,7 @@ pub fn string_to_i64(s: String) -> i64 {
 #[async_trait::async_trait(?Send)]
 impl gasket::framework::Worker<Stage> for Worker {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
-        log::info!("connecting to redis");
+        info!("connecting to redis");
         Ok(Self {
             connection: Some(
                 redis::Client::open(stage.config.connection_params.clone())

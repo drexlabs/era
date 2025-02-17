@@ -3,7 +3,7 @@ use std::sync::Arc;
 use gasket::framework::*;
 
 use gasket::messaging::{InputPort, OutputPort};
-use log::warn;
+use gasket_log::warn;
 use pallas::ledger::configs::byron::{genesis_utxos, GenesisUtxo};
 
 use pallas::ledger::traverse::MultiEraOutput;
@@ -464,7 +464,7 @@ impl gasket::framework::Worker<Stage> for Worker {
                     }
 
                     model::RawBlockPayload::Rollback(blocks) => {
-                        log::warn!("rolling back in enrich {:?}", blocks);
+                        warn!("rolling back in enrich {:?}", blocks);
 
                         for (i, raw_block) in blocks.iter().enumerate() {
                             let next_block_for_rollback = blocks.get(i + 1);

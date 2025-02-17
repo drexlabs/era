@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gasket::messaging::OutputPort;
-use log::warn;
+use gasket_log::{info, warn};
 use pallas::ledger::traverse::{MultiEraBlock, MultiEraHeader};
 use pallas::network::facades::PeerClient;
 use pallas::network::miniprotocols::chainsync::{HeaderContent, NextResponse};
@@ -53,14 +53,14 @@ pub struct Stage {
 #[async_trait::async_trait(?Send)]
 impl gasket::framework::Worker<Stage> for Worker {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
-        log::info!("pipeline: attempting to connect to the network");
+        info!("pipeline: attempting to connect to the network");
 
         let peer_session =
             PeerClient::connect(&stage.config.address, stage.ctx.chain.magic.clone())
                 .await
                 .or_retry()?;
 
-        log::info!("pipeline: connected to the network");
+        info!("pipeline: connected to the network");
 
         let mut worker = Self {
             min_depth: stage.config.min_depth.unwrap_or(10 as usize),
@@ -75,9 +75,9 @@ impl gasket::framework::Worker<Stage> for Worker {
 
         match stage.cursor.clone().last_point().unwrap() {
             Some(x) => {
-                log::info!("found existing cursor in storage plugin: {:?}", x);
+                info!("found existing cursor in storage plugin: {:?}", x);
                 let point: Point = x.try_into().unwrap();
-                log::info!("chainsync: cursor as i see it {:?}", point);
+                info!("chainsync: cursor as i see it {:?}", point);
                 peer.chainsync
                     .find_intersect(vec![point])
                     .await
@@ -95,7 +95,7 @@ impl gasket::framework::Worker<Stage> for Worker {
                         .unwrap();
                 }
                 crosscut::IntersectConfig::Tip => {
-                    log::info!("chainsync: at tip");
+                    info!("chainsync: at tip");
                     peer.chainsync
                         .intersect_tip()
                         .await
@@ -103,7 +103,7 @@ impl gasket::framework::Worker<Stage> for Worker {
                         .unwrap();
                 }
                 crosscut::IntersectConfig::Point(_, _) => {
-                    log::info!("chainsync: at point");
+                    info!("chainsync: at point");
                     let point = stage
                         .ctx
                         .as_ref()
@@ -119,7 +119,7 @@ impl gasket::framework::Worker<Stage> for Worker {
                         .unwrap();
                 }
                 crosscut::IntersectConfig::Fallbacks(_) => {
-                    log::info!("chainsync: at fallbacks");
+                    info!("chainsync: at fallbacks");
                     let points = &stage
                         .ctx
                         .intersect
@@ -145,7 +145,7 @@ impl gasket::framework::Worker<Stage> for Worker {
     ) -> Result<WorkSchedule<RawBlockPayload>, WorkerError> {
         if self.is_origin_start && !self.byron_genesis_sent {
             self.byron_genesis_sent = true;
-            log::warn!("chainsync (genesis): first things first");
+            warn!("chainsync (genesis): first things first");
 
             return Ok(WorkSchedule::Unit(RawBlockPayload::Genesis));
         }
@@ -199,14 +199,14 @@ impl gasket::framework::Worker<Stage> for Worker {
                     NextResponse::Await => Ok(WorkSchedule::Idle),
                 },
                 Err(_) => {
-                    log::warn!("got no response");
+                    warn!("got no response");
                     Ok(WorkSchedule::Idle)
                 }
             },
             false => match peer.chainsync.recv_while_must_reply().await.or_restart() {
                 Ok(n) => match n {
                     NextResponse::RollForward(h, t) => {
-                        log::warn!("chainsync (no agency): got block {:?}", t);
+                        warn!("chainsync (no agency): got block {:?}", t);
 
                         stage.chain_tip.set(t.1 as i64);
                         let parsed_headers = to_traverse(&h);
@@ -260,7 +260,6 @@ impl gasket::framework::Worker<Stage> for Worker {
             .send(unit.clone().into())
             .await
             .map_err(|_| WorkerError::Send)
-            .map(|_| ())
     }
 
     async fn teardown(&mut self) -> Result<(), WorkerError> {

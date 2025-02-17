@@ -1,5 +1,4 @@
 use gasket::messaging::OutputPort;
-use log::warn;
 use pallas::crypto::hash::Hash;
 use pallas::ledger::addresses::{Address, StakeAddress};
 use pallas::ledger::traverse::{MultiEraAsset, MultiEraOutput, OutputRef};
