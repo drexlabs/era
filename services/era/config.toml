@@ -8,6 +8,20 @@ backoff_factor = 2
 max_backoff_sec = 10
 dismissible = false
 
+[work_retry]
+max_retries = 100
+backoff_unit_sec = 1
+backoff_factor = 2
+max_backoff_sec = 10
+dismissible = false
+
+[teardown_retry]
+max_retries = 1
+backoff_unit_sec = 0
+backoff_factor = 0
+max_backoff_sec = 0
+dismissible = false
+
 [source]
 type = "N2N"
 address = "backbone.mainnet.cardanofoundation.org:3001"

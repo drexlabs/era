@@ -10,71 +10,70 @@ license = "Apache-2.0"
 readme = "README.md"
 authors = ["Mike Keen <mwk@mikekeen.com>"]
 
-[package.metadata.deb]
-maintainer = "Mike Keen <mwk@mikekeen.com>"
-copyright = "2024 Mike Keen"
-license-file = ["LICENSE", "4"]
-extended-description = """\
-A high-level, real-time blockchain indexer for Cardano and Redis"""
-# depends = "redis-server"
-section = "Developer Tools"
-priority = "optional"
-assets = [
-    ["target/release/era", "usr/bin/", "755"],
-    ["services/era/config.toml", "etc/era/config.toml", "644"],
-    ["services/redis/blocks.conf", "etc/redis/era-blocks.conf", "644"],
-    ["services/redis/state.conf", "etc/redis/era-state.conf", "644"],
-    ["services/era/era.service", "etc/systemd/system/era.service", "644"],
-    ["services/redis/blocks.service", "etc/systemd/system/redis-blocks.service", "644"],
-    ["services/redis/state.service", "etc/systemd/system/redis-state.service", "644"],
-    ["assets/mainnet-byron-genesis.json", "etc/era/mainnet-byron-genesis.json", "644"]
-]
+# [package.metadata.deb]
+# maintainer = "Mike Keen <mwk@mikekeen.com>"
+# copyright = "2024 Mike Keen"
+# license-file = ["LICENSE", "4"]
+# extended-description = """\
+# A high-level, real-time blockchain indexer for Cardano and Redis"""
+# # depends = "redis-server"
+# section = "Developer Tools"
+# priority = "optional"
+# assets = [
+#     ["target/release/era", "usr/bin/", "755"],
+#     ["services/era/config.toml", "etc/era/config.toml", "644"],
+#     ["services/redis/blocks.conf", "etc/redis/era-blocks.conf", "644"],
+#     ["services/redis/state.conf", "etc/redis/era-state.conf", "644"],
+#     ["services/era/era.service", "etc/systemd/system/era.service", "644"],
+#     ["services/redis/blocks.service", "etc/systemd/system/redis-blocks.service", "644"],
+#     ["services/redis/state.service", "etc/systemd/system/redis-state.service", "644"],
+#     ["assets/mainnet-byron-genesis.json", "etc/era/mainnet-byron-genesis.json", "644"]
+# ]
 
-[dev-dependencies]
-cargo-deb = "2.11.0"
+# [dev-dependencies]
+# cargo-deb = "2.11.0"
 
 [dependencies]
-pallas = "0.32.0"
+pallas = "*"
 pallas-bech32 = { git = "https://github.com/txpipe/pallas", package = "pallas-bech32" }
-chrono = "0.4.39"
-hex = "0.4.3"
-net2 = "0.2.39"
+chrono = "*"
+hex = "*"
+net2 = "*"
 #blake2 = "0.10.6"
 #bech32 = "0.11.0"
-async-trait = "0.1.80"
-clap = { version = "4.5.27", features = ["derive"] }
-merge = "0.1.0"
-config = { version = "0.15.6", default-features = false, features = [
+async-trait = "*"
+clap = { version = "*", features = ["derive"] }
+merge = "*"
+config = { version = "*", default-features = false, features = [
     "toml",
     "json",
 ] }
-serde = { version = "1.0.217", features = ["derive"] }
-serde_json = "1.0.137"
-serde_cbor = "0.11.2" 
-minicbor = { version = "0.25.1", features = ["std"] }
-prometheus_exporter = { version = "0.8.4", default-features = false }
-gasket = { version = "^0.9", features = ["derive"] }
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+serde_cbor = "*"
+minicbor = { version = "*", features = ["std"] }
+prometheus_exporter = { version = "*", default-features = false }
+gasket = { version = "*", features = ["derive"] }
 gasket-log = { path = "../gasket-log-rs/gasket-log" }
-thiserror = "2.0.11"
-redis = { version = "0.28.2", features = ["tokio-comp"] }
-lazy_static = "1.5.0"
-#crossbeam = "0.8.4"
+thiserror = "*"
+redis = { version = "*", features = ["tokio-comp"] }
+lazy_static = "*"
 #tonic = { version = "0.9.2", features = ["tls", "tls-roots"], optional = false }
-utxorpc = { version = "1.0.0-alpha.1" }
-sled = { version = "0.34.7", features = ["compression"] }
-futures = { version = "0.3.31", optional = true }
-tokio = { version = "1.43.0", features = ["full"], optional = true }
-tokio-util = "0.7.13"
-tokio-stream = "0.1.17"
-crossterm = "0.28.1"
+#utxorpc = { version = "1.0.0-alpha.1" }
+sled = { version = "*", features = ["compression"] }
+futures = { version = "*", optional = true }
+tokio = { version = "*", features = ["full"], optional = true }
+tokio-util = "*"
+tokio-stream = "*"
+crossterm = "*"
 
 # tui feature
-indicatif = { version = "0.17.9", optional = true }
-ratatui = {version = "0.26.2", optional = true}
+indicatif = { version = "*", optional = true }
+ratatui = {version = "*", optional = true}
 
 # required for CI to complete successfully
-openssl = { version = "0.10", optional = true, features = ["vendored"] }
-crossbeam-queue = "0.3.12"
+openssl = { version = "*", optional = true, features = ["vendored"] }
+crossbeam-queue = "*"
 
 [features]
 async = ["futures", "tokio"]

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use gasket::framework::*;
+use gasket::framework::{Stage as GasketStage, *};
 
 use gasket::messaging::{InputPort, OutputPort};
-use gasket_log::warn;
+use gasket_log::{debug, warn};
 use pallas::ledger::configs::byron::{genesis_utxos, GenesisUtxo};
 
 use pallas::ledger::traverse::MultiEraOutput;
@@ -359,6 +359,8 @@ pub struct Stage {
 #[async_trait::async_trait(?Send)]
 impl gasket::framework::Worker<Stage> for Worker {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
+        debug!("({}) starting up bootstrapper", stage.name());
+
         let enrich_config = sled::Config::default()
             .path(
                 stage

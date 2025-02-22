@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::model::{CRDTCommand, DecodedBlockAction};
 use crate::Error;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
 }

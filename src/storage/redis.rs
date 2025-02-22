@@ -21,7 +21,9 @@ impl ToRedisArgs for model::Value {
             model::Value::String(x) => x.write_redis_args(out),
             model::Value::BigInt(x) => x.to_string().write_redis_args(out),
             model::Value::Cbor(x) => x.write_redis_args(out),
-            model::Value::Json(x) => todo!("{}", x),
+            model::Value::Json(x) => serde_json::to_string(x)
+                .expect("JSON serialization failed")
+                .write_redis_args(out),
         }
     }
 }
@@ -147,8 +149,9 @@ impl gasket::framework::Worker<Stage> for Worker {
             .input
             .recv()
             .await
-            .or_retry()
-            .map(|msg| WorkSchedule::Unit(msg.payload))
+            .map_or(Ok(WorkSchedule::Idle), |msg| {
+                Ok(WorkSchedule::Unit(msg.payload))
+            })
     }
 
     async fn execute(&mut self, unit: &CRDTCommand, stage: &mut Stage) -> Result<(), WorkerError> {
@@ -156,7 +159,7 @@ impl gasket::framework::Worker<Stage> for Worker {
 
         match unit {
             CRDTCommand::Noop => Ok(()),
-            model::CRDTCommand::BlockStarting(_) => redis::cmd("MULTI")
+            CRDTCommand::BlockStarting(_) => redis::cmd("MULTI")
                 .query(self.connection.as_mut().unwrap())
                 .or_retry(),
 
@@ -299,8 +302,6 @@ impl gasket::framework::Worker<Stage> for Worker {
                 }
 
                 redis::cmd("EXEC").query(connection).or_retry()?;
-
-                warn!("donzeo");
 
                 stage.blocks_processed.inc(1);
 

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
+use crate::prelude::GasketStage;
 use gasket::messaging::OutputPort;
-use gasket_log::{info, warn};
-use pallas::ledger::traverse::{MultiEraBlock, MultiEraHeader};
+use gasket_log::{debug, info, warn};
+use pallas::ledger::traverse::MultiEraHeader;
 use pallas::network::facades::PeerClient;
 use pallas::network::miniprotocols::chainsync::{HeaderContent, NextResponse};
 use pallas::network::miniprotocols::Point;
@@ -53,14 +54,12 @@ pub struct Stage {
 #[async_trait::async_trait(?Send)]
 impl gasket::framework::Worker<Stage> for Worker {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
-        info!("pipeline: attempting to connect to the network");
+        debug!("[{}] Bootstrapping", stage.name());
 
         let peer_session =
             PeerClient::connect(&stage.config.address, stage.ctx.chain.magic.clone())
                 .await
                 .or_retry()?;
-
-        info!("pipeline: connected to the network");
 
         let mut worker = Self {
             min_depth: stage.config.min_depth.unwrap_or(10 as usize),
@@ -73,16 +72,25 @@ impl gasket::framework::Worker<Stage> for Worker {
 
         let ctx = Arc::clone(&stage.ctx);
 
-        match stage.cursor.clone().last_point().unwrap() {
+        match stage
+            .cursor
+            .clone()
+            .last_point()
+            .map_err(|_| WorkerError::Retry)?
+        {
             Some(x) => {
-                info!("found existing cursor in storage plugin: {:?}", x);
+                info!(
+                    "[{}] found existing cursor in storage plugin: {:?}",
+                    stage.name(),
+                    x
+                );
                 let point: Point = x.try_into().unwrap();
                 info!("chainsync: cursor as i see it {:?}", point);
                 peer.chainsync
                     .find_intersect(vec![point])
                     .await
-                    .map_err(crate::Error::ouroboros)
-                    .unwrap();
+                    .map(|_point| Ok(worker))
+                    .map_err(|_| WorkerError::Retry)?
             }
             None => match ctx.as_ref().intersect.clone().unwrap() {
                 crosscut::IntersectConfig::Origin => {
@@ -91,16 +99,16 @@ impl gasket::framework::Worker<Stage> for Worker {
                     peer.chainsync
                         .intersect_origin()
                         .await
-                        .map_err(crate::Error::ouroboros)
-                        .unwrap();
+                        .map(|_point| Ok(worker))
+                        .map_err(|_| WorkerError::Retry)?
                 }
                 crosscut::IntersectConfig::Tip => {
                     info!("chainsync: at tip");
                     peer.chainsync
                         .intersect_tip()
                         .await
-                        .map_err(crate::Error::ouroboros)
-                        .unwrap();
+                        .map(|_point| Ok(worker))
+                        .map_err(|_| WorkerError::Retry)?
                 }
                 crosscut::IntersectConfig::Point(_, _) => {
                     info!("chainsync: at point");
@@ -115,8 +123,8 @@ impl gasket::framework::Worker<Stage> for Worker {
                     peer.chainsync
                         .find_intersect(vec![point.clone()])
                         .await
-                        .map_err(crate::Error::ouroboros)
-                        .unwrap();
+                        .map(|_point| Ok(worker))
+                        .map_err(|_| WorkerError::Retry)?
                 }
                 crosscut::IntersectConfig::Fallbacks(_) => {
                     info!("chainsync: at fallbacks");
@@ -130,13 +138,11 @@ impl gasket::framework::Worker<Stage> for Worker {
                     peer.chainsync
                         .find_intersect(points.clone())
                         .await
-                        .map_err(crate::Error::ouroboros)
-                        .unwrap();
+                        .map(|_point| Ok(worker))
+                        .map_err(|_| WorkerError::Retry)?
                 }
             },
         }
-
-        Ok(worker)
     }
 
     async fn schedule(
@@ -145,7 +151,7 @@ impl gasket::framework::Worker<Stage> for Worker {
     ) -> Result<WorkSchedule<RawBlockPayload>, WorkerError> {
         if self.is_origin_start && !self.byron_genesis_sent {
             self.byron_genesis_sent = true;
-            warn!("chainsync (genesis): first things first");
+            warn!("[{}] scheduling genesis transactions", stage.name());
 
             return Ok(WorkSchedule::Unit(RawBlockPayload::Genesis));
         }

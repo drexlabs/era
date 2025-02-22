@@ -9,7 +9,7 @@ use crate::model::{self};
 use crate::model::{CRDTCommand, DecodedBlockAction};
 use crate::pipeline::Context;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
     pub policy_id: Option<String>,

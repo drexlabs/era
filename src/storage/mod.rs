@@ -24,10 +24,10 @@ pub enum Stage {
 }
 
 impl Config {
-    pub fn bootstrapper(self, ctx: Arc<Context>) -> Option<Bootstrapper> {
+    pub fn bootstrapper(self, ctx: Arc<Context>) -> Bootstrapper {
         match self {
-            Config::Skip(c) => Some(Bootstrapper::Skip(c.bootstrapper())),
-            Config::Redis(c) => Some(Bootstrapper::Redis(c.bootstrapper(ctx))),
+            Config::Skip(c) => Bootstrapper::Skip(c.bootstrapper()),
+            Config::Redis(c) => Bootstrapper::Redis(c.bootstrapper(ctx)),
         }
     }
 }
@@ -53,7 +53,7 @@ pub enum Bootstrapper {
 }
 
 impl Bootstrapper {
-    pub fn build_cursor(&mut self) -> Cursor {
+    pub fn cursor(&mut self) -> Cursor {
         match self {
             Bootstrapper::Skip(_) => Cursor::Skip,
             Bootstrapper::Redis(x) => Cursor::Redis(x.cursor.clone()),

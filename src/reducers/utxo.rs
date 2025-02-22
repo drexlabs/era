@@ -10,7 +10,7 @@ use crate::{model, prelude::*};
 
 const ERROR_MSG: &str = "could not send gasket message from utxo reducer";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
     pub coin_key_prefix: Option<String>,

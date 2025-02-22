@@ -1,7 +1,7 @@
 use chrono::Duration as ChronoDuration;
 use chrono::{DateTime, Utc};
 use crossterm::execute;
-use gasket::framework::{AsWorkError, WorkSchedule}; 
+use gasket::framework::{AsWorkError, WorkSchedule};
 use gasket::messaging::{InputPort, OutputPort};
 use gasket::runtime::Policy;
 use gasket::{
@@ -10,8 +10,6 @@ use gasket::{
     runtime::{StagePhase, TetherState},
 };
 use gasket_log::model::Log;
-use gasket_log::warn;
-use lazy_static::lazy_static;
 use ratatui::prelude::Layout;
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Padding};
 use serde::Deserialize;
@@ -21,12 +19,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::crosscut;
 
-use crate::model::{merge_metrics_snapshots, MeteredNumber, MeteredString, MeteredValue, MetricsSnapshot};
+use crate::model::{
+    merge_metrics_snapshots, MeteredNumber, MeteredString, MeteredValue, MetricsSnapshot,
+    ProgramOutput,
+};
 
 use super::{Context, Pipeline, StageTypes};
 
 use crossterm::{
-    event::{self, KeyCode, KeyEventKind}, 
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -57,7 +57,8 @@ impl FrameState {
         if self.frame_times.len() >= self.sample_window {
             self.frame_times.pop_front();
         }
-        self.frame_times.push_back(frame_time); 
+
+        self.frame_times.push_back(frame_time);
 
         self.last_frame = now;
     }
@@ -97,11 +98,7 @@ pub struct Bootstrapper {
 }
 
 impl Bootstrapper {
-    pub fn borrow_output_port(&mut self) -> &'_ mut OutputPort<()> {
-        &mut self.stage.output
-    }
-
-    pub fn borrow_input_port(&mut self) -> &'_ mut InputPort<Vec<Log>> {
+    pub fn borrow_input_port(&mut self) -> &'_ mut InputPort<ProgramOutput> {
         &mut self.stage.input
     }
 
@@ -110,7 +107,7 @@ impl Bootstrapper {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub mode: Mode,
 }
@@ -118,7 +115,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            mode: Default::default()
+            mode: Default::default(),
         }
     }
 }
@@ -128,7 +125,6 @@ impl Config {
         let stage = Stage {
             mode: self.mode,
             input: Default::default(),
-            output: Default::default(),
             frames_rendered: Default::default(),
             frame_time: Default::default(),
             metrics_snapshot_totality: Default::default(),
@@ -153,42 +149,41 @@ impl ConsoleWorker {
         snapshot: &MetricsSnapshot,
         visual_log_buffer: &VecDeque<Log>,
     ) {
-        
         let current_era = snapshot.chain_era.clone().unwrap().get_string();
 
         let provider = crosscut::time::NaiveProvider::new(ctx).await;
-        let wallclock = provider.slot_to_wallclock(snapshot.chain_bar_progress.clone().unwrap_or(MeteredValue::Numerical(MeteredNumber::default())).get_num());
+        let wallclock = provider.slot_to_wallclock(
+            snapshot
+                .chain_bar_progress
+                .clone()
+                .unwrap_or(MeteredValue::Numerical(MeteredNumber::default()))
+                .get_num(),
+        );
         let d = SystemTime::UNIX_EPOCH + Duration::from_secs(wallclock);
         let datetime = DateTime::<Utc>::from(d);
         let date_string = Some(datetime.format("%Y-%m-%d %H:%M:%S").to_string());
 
-        let mut log_buffer_string = String::default();
-
         let frame = self.terminal.get_frame();
 
         let layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints(vec![
-                        Constraint::Length(10),
-                        Constraint::Min(1),
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Length(5),
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Length(2),
-                    ])
-                    .split(frame.size());
+            .direction(Direction::Vertical)
+            .constraints(vec![
+                Constraint::Length(10),
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(5),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(2),
+            ])
+            .split(frame.size());
 
         let calc = if layout[1].height as usize >= 2 {
             layout[1].height as usize - 2
         } else {
             0
         };
-        
-        for entry in visual_log_buffer.iter().rev().take(calc) {
-            log_buffer_string += &entry.to_string();
-        }
 
         self.terminal
             .draw(|frame| {
@@ -256,8 +251,15 @@ impl ConsoleWorker {
 
                 //frame.render_widget(bottom_pane, layout[0]);
 
+                let log_lines: Vec<Line> = visual_log_buffer
+                    .iter()
+                    .rev()
+                    .take(calc)
+                    .map(|entry| Line::from(entry.to_string()))
+                    .collect();
+                
                 frame.render_widget(
-                    Paragraph::new(log_buffer_string)
+                    Paragraph::new(Text::from(log_lines))
                         .block(
                             ratatui::widgets::Block::new()
                                 .padding(Padding::new(
@@ -668,8 +670,7 @@ impl ConsoleWorker {
 #[stage(name = "console-renderer", unit = "()", worker = "ConsoleWorker")]
 pub struct Stage {
     pub mode: Mode,
-    pub input: InputPort<Vec<Log>>,
-    pub output: OutputPort<()>,
+    pub input: InputPort<ProgramOutput>,
     pub metrics_snapshot_totality: MetricsSnapshot,
     pub ctx: Arc<Context>,
     pub visual_log_buffer: VecDeque<Log>,
@@ -680,14 +681,14 @@ pub struct Stage {
     frame_time: gasket::metrics::Gauge,
 }
 
-#[async_trait::async_trait(?Send)] 
+#[async_trait::async_trait(?Send)]
 impl gasket::framework::Worker<Stage> for ConsoleWorker {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
         if let Mode::TUI = stage.mode {
             stdout().execute(EnterAlternateScreen).unwrap();
-            enable_raw_mode().unwrap(); 
+            enable_raw_mode().unwrap();
         }
-        
+
         Ok(Self {
             metrics_buffer: BlockGraph::new(RING_DEPTH),
             frame_state: FrameState::new(60),
@@ -695,52 +696,74 @@ impl gasket::framework::Worker<Stage> for ConsoleWorker {
         })
     }
 
-    async fn schedule(&mut self, stage: &mut Stage) -> Result<WorkSchedule<()>, WorkerError> {        
+    async fn schedule(&mut self, stage: &mut Stage) -> Result<WorkSchedule<()>, WorkerError> {
         match stage
             .input
             .recv()
             .await
             .map_err(|_| WorkerError::Recv)
-            .map(|u| u.payload)
+            .map(|u| u.payload)?
         {
-            Ok(logs) => {
+            ProgramOutput::Log(logs) => {
                 for item in logs {
                     stage.visual_log_buffer.push_back(item);
                     if stage.visual_log_buffer.len() > RING_DEPTH {
                         stage.visual_log_buffer.pop_front();
                     }
                 }
-                
-                //stage.metrics_snapshot_totality = merge_metrics_snapshots(&[stage.metrics_snapshot_totality.clone(), metrics_snapshot]); todo: bring tui metrics back in -- we need to be able to wrap the log output easily
-
-                if self.frame_state.should_render() {
-                    Ok(WorkSchedule::Unit(()))
-                } else {
-                    Ok(WorkSchedule::Idle)
-                }
-                
             }
-            Err(_) => Err(WorkerError::Retry),
+
+            ProgramOutput::Metrics(metrics) => {
+                for item in metrics {
+                    stage.metrics_snapshot_totality.merge(&item);
+
+                    self.metrics_buffer.push(item);
+                }
+            }
+        };
+
+        
+        
+        if self.frame_state.should_render() {
+            Ok(WorkSchedule::Unit(()))
+        } else {
+            let is_tui = match stage.mode {
+                Mode::Plain => false,
+                Mode::TUI => true,
+            };
+
+            if is_tui {
+                Ok(WorkSchedule::Idle)
+            } else {
+                Ok(WorkSchedule::Unit(()))
+            }
+            
+            
         }
     }
 
     async fn execute(&mut self, _unit: &(), stage: &mut Stage) -> Result<(), WorkerError> {
         let start = Instant::now();
-        
+
         match stage.mode {
             Mode::TUI => {
-                self.draw(Arc::clone(&stage.ctx), &stage.metrics_snapshot_totality, &stage.visual_log_buffer)
-                    .await;
+                self.draw(
+                    Arc::clone(&stage.ctx),
+                    &stage.metrics_snapshot_totality,
+                    &stage.visual_log_buffer,
+                )
+                .await;
 
-                self.metrics_buffer.push(stage.metrics_snapshot_totality.clone());
+                self.metrics_buffer
+                    .push(stage.metrics_snapshot_totality.clone());
             }
             Mode::Plain => {
-                // Plain console logic 
+                // Plain console logic
                 let terminal = self.terminal.backend_mut();
-                    for log in &stage.visual_log_buffer {
-                        execute!(terminal, crossterm::style::Print(log.to_string() + "\r\n"));
-                    };
-
+                while let Some(log) = stage.visual_log_buffer.pop_front() {
+                    execute!(terminal, crossterm::style::Print(format!("{}\n", log)))
+                        .map_err(|_| WorkerError::Retry)?;
+                }
             }
         };
 
@@ -750,11 +773,7 @@ impl gasket::framework::Worker<Stage> for ConsoleWorker {
         stage.frame_time.set(start.elapsed().as_micros() as i64);
         stage.frames_rendered.inc(1);
 
-        stage
-            .output
-            .send(().into())
-            .await
-            .map_err(|_| WorkerError::Send)
+        Ok(())
     }
 }
 
@@ -800,8 +819,6 @@ impl Default for Mode {
     }
 }
 
-
-
 pub struct BlockGraph {
     vec: VecDeque<MetricsSnapshot>,
     base_time: Instant,
@@ -838,7 +855,7 @@ impl BlockGraph {
         let mut max: Duration = Default::default();
 
         for snapshot in self.vec.clone() {
-            let current = snapshot.timestamp.unwrap();
+            let current = snapshot.timestamp.unwrap_or_default();
 
             if current < min || min == Duration::default() {
                 min = current;
@@ -868,7 +885,8 @@ impl BlockGraph {
         let mut stub_metrics_snapshot: MetricsSnapshot = Default::default();
         stub_metrics_snapshot.timestamp = match self.vec.clone().get(0) {
             Some(s) => s
-                .timestamp.unwrap()
+                .timestamp
+                .unwrap_or_default()
                 .checked_sub(Duration::from_millis(1000)),
             _ => stub_metrics_snapshot.timestamp,
         };
@@ -895,17 +913,17 @@ impl BlockGraph {
             } else {
                 previous_snapshot
                     .get_metrics_key(prop_name)
-                    .unwrap()
-                    .get_num()
+                    .map(|v| v.get_num())
+                    .unwrap_or(0)
             };
 
             let current_value = self
                 .get_prop_value_for_index(prop_name, i)
-                .unwrap()
-                .get_num();
+                .map(|v| v.get_num())
+                .unwrap_or(0);
 
             let time_diff = if current_duration > previous_duration {
-                (current_duration.unwrap() - previous_duration.unwrap()).as_secs_f64()
+                (current_duration.unwrap() - previous_duration.unwrap_or_default()).as_secs_f64()
             } else {
                 0.0
             };
@@ -922,7 +940,10 @@ impl BlockGraph {
                 0.0
             };
 
-            rates.push((current_snapshot.timestamp.unwrap().as_secs_f64(), rate_of_increase));
+            rates.push((
+                current_snapshot.timestamp.unwrap_or_default().as_secs_f64(),
+                rate_of_increase,
+            ));
         }
 
         let mut final_rates: [(f64, f64); RING_DEPTH] = [(0.0, 0.0); RING_DEPTH];
@@ -991,4 +1012,4 @@ pub fn i64_to_string(mut i: i64) -> String {
     s.chars().rev().collect::<String>()
 }
 
-const RING_DEPTH: usize = 100;
+const RING_DEPTH: usize = 10;

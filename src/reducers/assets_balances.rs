@@ -38,7 +38,7 @@ struct PreviousOwnerAgg {
     transferred_out: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
     pub filter: Option<crosscut::filters::Predicate>,

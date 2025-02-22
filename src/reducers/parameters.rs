@@ -7,7 +7,7 @@ use crate::{model, Error};
 use gasket::messaging::OutputPort;
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
 }

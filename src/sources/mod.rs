@@ -22,10 +22,10 @@ pub enum Config {
 }
 
 impl Config {
-    pub fn bootstrapper(self, ctx: Arc<Context>, cursor: Cursor) -> Option<Bootstrapper> {
+    pub fn bootstrapper(self, ctx: Arc<Context>, cursor: Cursor) -> Bootstrapper {
         match self {
-            Config::N2N(c) => Some(Bootstrapper::N2N(c.bootstrapper(ctx, cursor))),
-            Config::N2C(c) => Some(Bootstrapper::N2C(c.bootstrapper(ctx, cursor))),
+            Config::N2N(c) => Bootstrapper::N2N(c.bootstrapper(ctx, cursor)),
+            Config::N2C(c) => Bootstrapper::N2C(c.bootstrapper(ctx, cursor)),
         }
     }
 }

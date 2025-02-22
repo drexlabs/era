@@ -11,7 +11,7 @@ use crate::{
     pipeline::Context,
 };
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
     pub policy_ids_hex: Option<Vec<String>>,

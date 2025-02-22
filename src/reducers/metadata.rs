@@ -12,7 +12,7 @@ use crate::crosscut;
 use crate::model::{CRDTCommand, DecodedBlockAction, Delta};
 use crate::pipeline::Context;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub key_prefix: Option<String>,
     pub royalty_key_prefix: Option<String>,

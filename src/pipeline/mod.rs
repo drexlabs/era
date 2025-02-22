@@ -1,4 +1,7 @@
 pub mod console;
+pub mod logs;
+
+use crate::prelude::GasketStage;
 
 use std::borrow::BorrowMut;
 use std::cell::RefCell;
@@ -6,23 +9,21 @@ use std::sync::Arc;
 
 use crate::{crosscut, model::ConfigRoot};
 
-use crate::model::{merge_metrics_snapshots, MeteredValue, MetricsSnapshot, TetherSnapshot};
-use console::Mode;
-use futures::TryFutureExt;
-use gasket::messaging::tokio::funnel_ports;
+use crate::model::{merge_metrics_snapshots, MeteredValue, MetricsSnapshot, ProgramOutput};
+use gasket::messaging::tokio::broadcast_port;
 use gasket::messaging::OutputPort;
 use gasket::metrics::Reading;
+use gasket::runtime::spawn_stage;
 use gasket::{
     framework::*,
     messaging::tokio::connect_ports,
     runtime::{Policy, StagePhase, Tether, TetherState},
 };
-use gasket_log::warn;
+use gasket_log::{debug, warn, InputPort};
 use pallas::ledger::{configs::byron::GenesisFile, traverse::wellknown::GenesisValues};
 use serde::Deserialize;
-use tokio::time::{sleep, Instant};
 
-pub static GASKET_CAP: usize = 100;
+pub static GASKET_CAP: usize = 10000;
 
 pub enum StageTypes {
     Source,
@@ -64,7 +65,7 @@ impl Bootstrapper {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub display_mode: Option<console::Mode>,
 }
@@ -78,12 +79,13 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn bootstrapper(self, root_config: RefCell<ConfigRoot>) -> Bootstrapper {
+    pub fn bootstrapper(self, root_config: RefCell<ConfigRoot>, ctx: Arc<Context>) -> Bootstrapper {
         Bootstrapper {
             stage: Stage {
                 output: Default::default(),
                 config: root_config,
                 stage_config: self,
+                ctx,
             },
         }
     }
@@ -97,13 +99,15 @@ impl Config {
 )]
 pub struct Stage {
     pub config: RefCell<ConfigRoot>,
-    pub output: RefCell<OutputPort<()>>,
+    pub output: OutputPort<ProgramOutput>,
     pub stage_config: Config,
+    pub ctx: Arc<Context>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl gasket::framework::Worker<Stage> for Pipeline {
     async fn bootstrap(stage: &Stage) -> Result<Self, WorkerError> {
+        debug!("[{}] Bootstrapping", stage.name());
         let mut config = stage.config.borrow_mut();
 
         let mut pipe = Self {
@@ -111,42 +115,28 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             tethers: Default::default(),
             tether_states: Default::default(),
             chain_config: Arc::new(config.chain.take().unwrap_or_default()),
-            ctx: config.take_some_to_make_context(),
         };
 
-        let logs = config.logging.take().unwrap_or_default();
-        let output = config.display.take().unwrap_or_default();
-        let mut output_stage = output.bootstrapper(Arc::clone(&pipe.ctx));
-        let logs_stage = logs.bootstrapper(vec![output_stage.borrow_input_port()]);
-        logs_stage.spawn(pipe.policy.clone());
-
-        pipe.tethers
-            .push(output_stage.spawn_stage(pipe.policy.clone()));
-
-        pipe.wait_for_tethers();
-
         let enrich = config.enrich.take().unwrap_or_default();
-        let mut enrich_stage = enrich.bootstrapper(Arc::clone(&pipe.ctx));
+        let mut enrich_stage = enrich.bootstrapper(Arc::clone(&stage.ctx));
 
         let mut storage_stage = config
             .storage
             .take()
             .unwrap()
-            .bootstrapper(Arc::clone(&pipe.ctx))
-            .unwrap();
+            .bootstrapper(Arc::clone(&stage.ctx));
 
         let mut source_stage = config
             .source
             .take()
             .unwrap()
-            .bootstrapper(Arc::clone(&pipe.ctx), storage_stage.build_cursor()) // todo check into this build_cursor again
-            .unwrap();
+            .bootstrapper(Arc::clone(&stage.ctx), storage_stage.cursor());
 
         let mut reducers_stage = config
             .reducers
             .take()
             .unwrap()
-            .bootstrapper(Arc::clone(&pipe.ctx), storage_stage.borrow_input_port());
+            .bootstrapper(Arc::clone(&stage.ctx), storage_stage.borrow_input_port());
 
         connect_ports(
             source_stage.borrow_output_port(),
@@ -160,13 +150,11 @@ impl gasket::framework::Worker<Stage> for Pipeline {
             GASKET_CAP,
         );
 
-        // funnel_ports(
-        //     vec![&mut stage.output.borrow_mut()],
-        //     output_stage.borrow_input_port(),
-        //     GASKET_CAP,
-        // );
-
-        pipe.wait_for_tethers();
+        connect_ports(
+            reducers_stage.borrow_output_port(),
+            storage_stage.borrow_input_port(),
+            GASKET_CAP,
+        );
 
         pipe.tethers
             .push(storage_stage.spawn_stage(pipe.policy.clone()));
@@ -174,14 +162,13 @@ impl gasket::framework::Worker<Stage> for Pipeline {
         pipe.tethers
             .push(reducers_stage.spawn_stage(pipe.policy.clone()));
 
-        //pipe.wait_for_tethers();
-
         pipe.tethers
             .push(enrich_stage.spawn_stage(pipe.policy.clone()));
 
         pipe.tethers
             .push(source_stage.spawn_stage(pipe.policy.clone()));
 
+        warn!("bootstrapped pipeline!!");
         return Ok(pipe);
     }
 
@@ -240,7 +227,7 @@ impl gasket::framework::Worker<Stage> for Pipeline {
                     readings.iter().fold(
                         accum_snap.clone(),
                         |mut snapshot, (metric_key_name, reading)| {
-                            let t_name = tether.name().clone();
+                            let t_name = tether.name();
 
                             match (t_name, &**metric_key_name, reading) {
                                 // todo: lmfao clearly the wrong approach is being used by me here. &**, ghastly.
@@ -370,14 +357,27 @@ impl gasket::framework::Worker<Stage> for Pipeline {
         unit: &Vec<MetricsSnapshot>,
         stage: &mut Stage,
     ) -> Result<(), WorkerError> {
-        // stage
-        //     .output
-        //     .borrow_mut()
-        //     .send(gasket::messaging::Message {
-        //         payload: ProgramOutput::Metrics(merge_metrics_snapshots(unit)),
-        //     })
-        //     .map_err(|_| WorkerError::Send)
-        //     .await?;
+        match stage
+            .config
+            .borrow()
+            .display
+            .clone()
+            .unwrap_or_default()
+            .mode
+        {
+            console::Mode::TUI => {
+                stage
+                    .output
+                    .borrow_mut()
+                    .send(gasket::messaging::Message {
+                        payload: ProgramOutput::Metrics(unit.clone()),
+                    })
+                    .await
+                    .or_retry()?;
+            }
+
+            console::Mode::Plain => {}
+        };
 
         Ok(())
     }
@@ -386,7 +386,6 @@ impl gasket::framework::Worker<Stage> for Pipeline {
 pub struct Pipeline {
     pub policy: Policy,
     pub tethers: Vec<Tether>,
-    pub ctx: Arc<Context>,
     pub chain_config: Arc<crosscut::ChainConfig>,
     pub tether_states: Vec<TetherState>,
 }

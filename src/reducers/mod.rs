@@ -17,7 +17,7 @@ pub mod utils;
 pub mod utxo;
 pub mod worker;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum Config {
     Utxo(utxo::Config),

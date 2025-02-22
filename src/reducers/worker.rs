@@ -1,6 +1,7 @@
 use futures::future::join_all;
 use gasket::messaging::tokio::funnel_ports;
 use gasket::runtime::{Policy, Tether};
+use gasket_log::debug;
 use pallas::crypto::hash::Hash;
 use pallas::ledger::traverse::Era;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use super::Reducer;
 
 use gasket::framework::*;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config(Vec<crate::reducers::Config>);
 
 impl Config {

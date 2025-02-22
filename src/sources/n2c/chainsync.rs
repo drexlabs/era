@@ -42,7 +42,7 @@ impl gasket::framework::Worker<Stage> for Worker {
         let ctx = Arc::clone(&stage.ctx);
 
         warn!(
-            "pipeline: attempting to connect to the network {}",
+            "pipeline: attempting to connect! to the network {}",
             stage.name()
         );
 

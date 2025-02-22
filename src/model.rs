@@ -8,6 +8,7 @@ use std::convert::Into;
 use gasket::metrics::Readings;
 use gasket::runtime::{Policy, TetherState};
 use gasket_log::{debug, info};
+use model::Log;
 use pallas::crypto::hash::Hash;
 use pallas::ledger::configs::byron::{from_file, GenesisUtxo};
 use pallas::{
@@ -20,7 +21,7 @@ use serde::Deserialize;
 use crate::pipeline::{Context, StageTypes};
 use crate::{crosscut, enrich, prelude::*, reducers, sources, storage};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct ConfigRoot {
     pub source: Option<sources::Config>,
     pub enrich: Option<enrich::Config>,
@@ -62,7 +63,7 @@ impl ConfigRoot {
 
     pub fn gasket_policy(&self) -> Policy {
         Policy {
-            tick_timeout: self.tick_timeout,
+            tick_timeout: self.tick_timeout.clone(),
             bootstrap_retry: self.bootstrap_retry.clone().unwrap_or_default(),
             work_retry: self.work_retry.clone().unwrap_or_default(),
             teardown_retry: self.teardown_retry.clone().unwrap_or_default(),
@@ -84,7 +85,7 @@ impl ConfigRoot {
             .take()
             .unwrap_or(format!("assets/{}-byron-genesis.json", chaintag,));
 
-        info!("making context: with genesis ({})", genesis_path);
+        info!("building context ({})", genesis_path);
 
         Arc::new(Context {
             chain: chain.into(),
@@ -150,6 +151,12 @@ pub struct TetherSnapshot {
     pub name: String,
     pub state: TetherState,
     pub snapshot: MetricsSnapshot,
+}
+
+#[derive(Clone)]
+pub enum ProgramOutput {
+    Log(Vec<Log>),
+    Metrics(Vec<MetricsSnapshot>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -347,11 +354,11 @@ fn merge_field<T: Clone + PartialEq>(target: &mut Option<T>, source: &Option<T>)
 impl MetricsSnapshot {
     pub fn get_metrics_key(&self, prop_name: &str) -> Option<MeteredValue> {
         match prop_name {
-            "chain_era" => Some(self.chain_era.clone().unwrap()),
-            "chain_bar_depth" => Some(self.chain_bar_depth.clone().unwrap()),
-            "chain_bar_progress" => Some(self.chain_bar_progress.clone().unwrap()),
-            "blocks_processed" => Some(self.blocks_processed.clone().unwrap()),
-            "transactions" => Some(self.transactions.clone().unwrap()),
+            "chain_era" => self.chain_era.clone(),
+            "chain_bar_depth" => self.chain_bar_depth.clone(),
+            "chain_bar_progress" => self.chain_bar_progress.clone(),
+            "blocks_processed" => self.blocks_processed.clone(),
+            "transactions" => self.transactions.clone(),
             _ => None,
         }
     }
